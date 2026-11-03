@@ -4,6 +4,10 @@
 
 本项目是 [dsh-cite-lens](https://github.com/adithyanraj03/dsh-cite-lens) 0.3.1（MIT）的**本地改造版**，独立维护，不跟随上游发布。
 
+> **项目文档（决策/进度/发布/已知问题）不在这里**，在 Obsidian 库：
+> `D:\Obsidian\第二大脑\02_Code_Library（代码库）\dsh-paper-lens\`
+> 本目录只放源码、构建与 git 历史；版本历史以本仓库的 `git tag` 为准。
+
 ## 和上游的差别
 
 | 项目 | 上游 dsh-cite-lens 0.3.1 | 本版 |
