@@ -1,0 +1,15 @@
+# 依赖与构建缓存
+node_modules/
+
+# 上游原始快照：只作对照，不是本项目的源码（需要时从 GitHub 重新取）
+upstream-cite-lens-0.3.1/
+
+# 编辑器与系统噪声
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.log
+
+# 注意：lib/client.js 虽然是生成物，但必须提交。
+# 本插件是「本地目录安装」的：应用不会在安装时跑构建，缺了它右侧边栏就没有界面。

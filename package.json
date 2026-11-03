@@ -1,0 +1,65 @@
+{
+  "name": "dsh-paper-lens",
+  "version": "0.1.0",
+  "description": "Paper Lens：在项目里打开 PDF 就能用——右侧边栏阅读、划词翻译、划词引用到当前会话。基于 dsh-cite-lens 0.3.1（MIT）改造。",
+  "icon": "assets/icon.png",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/index.js",
+    "lib",
+    "cordis.patch.yml",
+    "package.json",
+    "README.md",
+    "LICENSE",
+    "dsh.plugin.json",
+    "screenshots.json",
+    "assets/icon.png"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-ui-sidebar-documentpreview",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ],
+      "external": []
+    }
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.1-rc.3"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "deepseek-harness",
+    "pdf",
+    "translation",
+    "citations",
+    "research",
+    "papers"
+  ],
+  "author": "本地自用版（fork of dsh-cite-lens 0.3.1 by Adithya N Raj）",
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "pdfjs-dist": "^6.4.299"
+  }
+}
