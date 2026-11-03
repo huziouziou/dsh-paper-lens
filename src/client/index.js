@@ -78,12 +78,16 @@ const CSS = [
   '.dpa-pop button.dpa-translate:hover{background:#0d6b63}',
   // 译文气泡跟随应用主题（明/暗），而不是写死的深色底——写死深色在浅色主题下对比很糟。
   '.dpa-tr{position:fixed;z-index:1001;display:flex;flex-direction:column;max-height:56vh;border-radius:10px;background:var(--dsw-alias-bg-overlay,#ffffff);color:var(--dsw-alias-label-primary,#1f2937);border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));box-shadow:0 10px 30px rgba(0,0,0,.18);font:13px/1.65 system-ui,sans-serif}',
-  '.dpa-tr-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px 6px 11px;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));font-size:12px;font-weight:500;color:var(--dsw-alias-label-secondary,#475569)}',
+  '.dpa-tr-head{display:flex;align-items:center;gap:6px;padding:5px 8px 5px 6px;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));font-size:12px;font-weight:500;color:var(--dsw-alias-label-secondary,#475569);cursor:move;user-select:none;touch-action:none}',
+  '.dpa-tr-grip{letter-spacing:-2px;opacity:.45}',
+  '.dpa-tr-title{flex:1}',
   '.dpa-tr-head button{border:none;background:transparent;color:inherit;cursor:pointer;font:inherit;line-height:1;padding:2px 6px;border-radius:5px}',
   '.dpa-tr-head button:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.16))}',
   '.dpa-tr-body{padding:10px 12px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:var(--dsw-alias-label-primary,#1f2937)}',
   '.dpa-tr-body.dpa-err{color:#dc2626}',
-  '.dpa-tr-loading{opacity:.65}',
+  '.dpa-tr-body.dpa-tr-loading{opacity:.9}',
+  '.dpa-tr-caret{display:inline-block;width:2px;height:1em;margin-left:1px;vertical-align:text-bottom;background:currentColor;animation:dpa-blink 1s steps(1) infinite}',
+  '@keyframes dpa-blink{0%,50%{opacity:1}50.01%,100%{opacity:0}}',
   '.dpa-center{padding:40px;text-align:center;color:var(--dsw-alias-label-secondary,#aaa)}',
   `::highlight(${HIGHLIGHT}){color:#60a5fa;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px}`,
   // pdf.js text layer: transparent, selectable text over the canvas.
@@ -214,8 +218,11 @@ function PdfAskBody(props) {
   const [zoomLabel, setZoomLabel] = useState('');
   const [pop, setPop] = useState(null);
   const [note, setNote] = useState(null);
-  /** 划词翻译气泡：{ phase: 'loading'|'done'|'error', rect, text?, error? } */
+  /** 划词翻译气泡：{ phase: 'streaming'|'done'|'error', rect, text?, error? } */
   const [tr, setTr] = useState(null);
+  /** 气泡被拖动后的位移（相对选区位置），null = 还没动过。 */
+  const [trDrag, setTrDrag] = useState(null);
+  const trBodyRef = useRef(null);
 
   const say = useCallback((text, error = false) => {
     setNote({ text, error, at: Date.now() });
@@ -376,10 +383,11 @@ function PdfAskBody(props) {
   };
 
   /**
-   * 划词翻译：把选中的原文发给服务端，拿回一整段译文再显示。
+   * 划词翻译：把选中的原文发给服务端，译文边到边显示。
    *
-   * 用应用当前的默认模型（服务端通过 agentDefaultModel 取），所以不需要配端点、不需要 key。
-   * 界面要求的是一次出，所以这里等服务端把整个译文算完再渲染，不做流式。
+   * 服务端回的是 NDJSON（一行一个 JSON）：`{delta}` 增量、`{error}` 失败、`{done}` 结束。
+   * 用 JSON 行是因为译文本身带换行，纯文本流没法区分「内容结束」和「内容里有个换行」。
+   * 模型由服务端决定（优先该会话实际路由的模型），所以这里不需要端点或 key。
    */
   const translateSelection = async () => {
     if (!pop) return;
@@ -387,13 +395,16 @@ function PdfAskBody(props) {
     const rect = pop.rect;
     setPop(null);
     setEnds(null);
+    setTrDrag(null);
     if (!text) {
       say('没有选中可翻译的文字', true);
       return;
     }
-    setTr({ phase: 'loading', rect });
+    setTr({ phase: 'streaming', rect, text: '' });
     // 原文已经拿到，清掉 PDF 上的选区：气泡压在选区上会看花，也让人以为气泡里的字被选住了。
     document.getSelection()?.removeAllRanges();
+
+    const fail = (error) => setTr({ phase: 'error', rect, error });
     try {
       const response = await fetch(`${PLUGIN_BASE}/translate`, {
         method: 'POST',
@@ -402,16 +413,81 @@ function PdfAskBody(props) {
         // 与官方压缩调用（passes agent.session.id）保持一致。
         body: JSON.stringify({ text, session: lastSessionId() }),
       });
-      const data = await response.json().catch(() => null);
-      if (!response.ok || typeof data?.translation !== 'string' || !data.translation) {
-        setTr({ phase: 'error', rect, error: data?.error || `翻译失败（HTTP ${response.status}）` });
+      if (!response.ok || !response.body) {
+        const data = await response.json().catch(() => null);
+        fail(data?.error || `翻译失败（HTTP ${response.status}）`);
         return;
       }
-      setTr({ phase: 'done', rect, text: data.translation });
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let acc = '';
+      let painted = 0;
+      // 增量可能一个 token 一行；每行都 setState 会让 React 疯狂重渲染，
+      // 所以攒到 ~60ms 再刷一次，最后一个 delta 由结尾统一收口。
+      const paint = (force) => {
+        const now = Date.now();
+        if (!force && now - painted < 60) return;
+        painted = now;
+        setTr({ phase: 'streaming', rect, text: acc });
+      };
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let nl = buffer.indexOf('\n');
+        while (nl >= 0) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          nl = buffer.indexOf('\n');
+          if (!line) continue;
+          let msg;
+          try { msg = JSON.parse(line); } catch { continue; }
+          if (msg?.error) { fail(String(msg.error)); return; }
+          if (typeof msg?.delta === 'string') { acc += msg.delta; paint(false); }
+        }
+      }
+      // 流里最后一行可能没有换行符。
+      if (buffer.trim()) {
+        try {
+          const msg = JSON.parse(buffer.trim());
+          if (msg?.error) { fail(String(msg.error)); return; }
+          if (typeof msg?.delta === 'string') acc += msg.delta;
+        } catch { /* 半个 JSON 就丢掉 */ }
+      }
+
+      const final = acc.trim();
+      if (!final) { fail('模型没有返回译文'); return; }
+      setTr({ phase: 'done', rect, text: final });
     } catch (error) {
-      setTr({ phase: 'error', rect, error: `翻译失败：${error?.message ?? error}` });
+      fail(`翻译失败：${error?.message ?? error}`);
     }
   };
+
+  /** 按住标题栏拖动译文气泡；位置是相对选区位置的位移。 */
+  const startTrDrag = (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const base = trDrag ?? { dx: 0, dy: 0 };
+    const move = (e) => setTrDrag({ dx: base.dx + (e.clientX - startX), dy: base.dy + (e.clientY - startY) });
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+
+  // 流式输出时跟着滚到底，否则新到的译文会藏在可视区下面。
+  useEffect(() => {
+    if (tr?.phase !== 'streaming') return;
+    const body = trBodyRef.current;
+    if (body) body.scrollTop = body.scrollHeight;
+  }, [tr?.phase, tr?.text]);
 
   const send = (action) => {
     if (!pop) return;
@@ -449,13 +525,17 @@ function PdfAskBody(props) {
       })()
     : null;
 
-  // 译文气泡贴在选区下方；宽度按窗口收着点，长段落在框内滚动。
+  // 译文气泡默认贴在选区下方；拖过之后按位移走，并且始终收在窗口内。
   const trStyle = tr
     ? (() => {
         const width = Math.max(260, Math.min(420, window.innerWidth - 32));
-        const left = Math.max(8, Math.min(window.innerWidth - width - 8, (tr.rect?.left ?? 8) + (tr.rect?.width ?? 0) / 2 - width / 2));
-        const top = (tr.rect?.bottom ?? 120) + 8;
-        return { left: `${left}px`, top: `${Math.max(8, Math.min(top, window.innerHeight - 120))}px`, width: `${width}px` };
+        const baseLeft = Math.max(8, Math.min(window.innerWidth - width - 8, (tr.rect?.left ?? 8) + (tr.rect?.width ?? 0) / 2 - width / 2));
+        const baseTop = Math.max(8, Math.min((tr.rect?.bottom ?? 120) + 8, window.innerHeight - 140));
+        const dx = trDrag?.dx ?? 0;
+        const dy = trDrag?.dy ?? 0;
+        const left = Math.max(4, Math.min(window.innerWidth - width - 4, baseLeft + dx));
+        const top = Math.max(4, Math.min(window.innerHeight - 64, baseTop + dy));
+        return { left: `${left}px`, top: `${top}px`, width: `${width}px` };
       })()
     : null;
 
@@ -534,16 +614,28 @@ function PdfAskBody(props) {
           { className: 'dpa-tr', style: trStyle, role: 'dialog', 'aria-label': '划词翻译' },
           h(
             'div',
-            { className: 'dpa-tr-head' },
-            h('span', null, tr.phase === 'loading' ? '正在翻译…' : tr.phase === 'error' ? '翻译失败' : '译文'),
-            h('button', { type: 'button', title: '关闭', onClick: () => setTr(null) }, '×'),
+            { className: 'dpa-tr-head', onPointerDown: startTrDrag, title: '按住这里可以拖动' },
+            h('span', { className: 'dpa-tr-grip', 'aria-hidden': 'true' }, '⋮⋮'),
+            h(
+              'span',
+              { className: 'dpa-tr-title' },
+              tr.phase === 'streaming' ? '正在翻译…' : tr.phase === 'error' ? '翻译失败' : '译文',
+            ),
+            h('button', {
+              type: 'button',
+              title: '关闭',
+              onPointerDown: (event) => event.stopPropagation(), // 别让点关闭变成拖动
+              onClick: () => setTr(null),
+            }, '×'),
           ),
           h(
             'div',
             {
-              className: `dpa-tr-body${tr.phase === 'error' ? ' dpa-err' : ''}${tr.phase === 'loading' ? ' dpa-tr-loading' : ''}`,
+              ref: trBodyRef,
+              className: `dpa-tr-body${tr.phase === 'error' ? ' dpa-err' : ''}${tr.phase === 'streaming' ? ' dpa-tr-loading' : ''}`,
             },
-            tr.phase === 'loading' ? '正在翻译…' : tr.phase === 'error' ? tr.error : tr.text,
+            tr.phase === 'error' ? tr.error : (tr.text || (tr.phase === 'streaming' ? '' : '')),
+            tr.phase === 'streaming' ? h('span', { className: 'dpa-tr-caret', 'aria-hidden': 'true' }) : null,
           ),
         )
       : null,

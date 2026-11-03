@@ -42,13 +42,33 @@ DSH `0.2.1-rc.5` 起，桌面的 `desktop` profile 只能由应用自己管理�
 
 | 按钮 | 作用 |
 |---|---|
-| **译** | 翻成简体中文，结果只显示译文；公式/变量名/数字/单位保持原样 |
+| **译** | 翻成简体中文，**边翻边出**（流式），结果只显示译文；公式/变量名/数字/单位保持原样。气泡可**按住标题栏拖动** |
 | 引用 | 把这段带 `文件 · p.N` 引用到当前会话输入框 |
 | 提问 | 引用后把光标放到「问题：」后面 |
 | 解释 | 引用后请模型解释这段在论文里的作用 |
 | 挑错 | 引用后请模型检查这段有无无依据的说法 |
 
 `/cite-links` 让当前会话把每条关于论文的论断都链到 PDF（可 `on` / `off` / `status`）。
+
+## 版本记录
+
+本目录是 git 仓库，版本用标签标记：
+
+```powershell
+git log --oneline --decorate     # 提交历史
+git tag -l                       # 已发布版本
+git show v0.1.0 --stat           # 某一版改了哪些文件
+git diff v0.1.0 HEAD -- src      # 两版之间的代码差异
+```
+
+发新版本时：改 `package.json` 与 `dsh.plugin.json` 的 `version` → `npm run build` → `npm test` → 提交 → `git tag -a vX.Y.Z -m '…'`。
+
+已发布的版本：
+
+| 标签 | 内容 |
+|---|---|
+| `v0.1.0` | 首个可用版：划词翻译（一次出）、界面中文化、引用/提问的会话兜底修复、自绘图标 |
+| `v0.2.0` | 翻译改流式 + 气泡可拖动 + 翻译路由契约测试 |
 
 ## 开发
 
@@ -82,12 +102,23 @@ upstream-cite-lens-0.3.1/   上游原始快照，仅作对照，勿改
 
 ### 翻译是怎么实现的
 
-- 服务端 `POST /plugin-data/dsh-paper-lens/translate`，请求体 `{ text, session }`，返回 `{ translation }`
+- 服务端 `POST /plugin-data/dsh-paper-lens/translate`，请求体 `{ text, session }`，响应是 **NDJSON 流**：
+  - `{"delta":"…"}` 增量文字
+  - `{"error":"…"}` 失败（含分片直方图、结束原因、失败码）
+  - `{"done":true}` 正常结束
+
+  用 JSON 行而不是裸文本，是因为译文本身带换行，纯文本流无法区分「内容」与「结束」。
 - 模型按顺序取：**该会话实际路由到的模型**（`agent.session.requestHeader().config`，与官方压缩调用同源，一定带可用凭据）→ `ctx.agentDefaultModel.currentSelection()` → 插件配置里的 `provider`/`model`
-- 用 `ctx.llm.stream()`（`@deepseek-ai/dsh-llm` 的服务）把分片读干再一次性返回；**必须带 `sessionId`**，适配器据此解析凭据
-- 分片解析是宽容的：`text-delta` 累加，只有 `block-end` 时取整块；**排除 `reasoning-delta`**（那是思考过程，不是译文）
-- 失败时错误信息带上分片直方图、结束原因、失败码与失败消息，便于定位而不是只报「没有返回译文」
+- 用 `ctx.llm.stream()`（`@deepseek-ai/dsh-llm` 的服务）；**必须带 `sessionId`**，适配器据此解析凭据
+- 分片解析是宽容的：`text-delta` 累加并即时推送，只有 `block-end` 时把整块当一次增量；**排除 `reasoning-delta`**（那是思考过程，不是译文）
+- 客户端按行解析，增量约 60ms 合并一次再重渲染，避免一个 token 一次 setState；流式时气泡正文自动滚到底
+- 校验（方法/空文本/超长）发生在发头之前，所以那几种失败仍是正常的 HTTP 状态码；一旦开始流式，失败只能作为一行 `error` 回来
 - 单次上限 6000 字符（服务端 `MAX_TRANSLATE_CHARS`）
+
+### 译文气泡
+
+- 默认贴在选区下方；**按住标题栏可拖动**，位移相对选区位置，并始终收在窗口内
+- 颜色跟随应用主题变量（`--dsw-alias-bg-overlay` / `label-primary` / `border-l2`），深浅主题都可读
 
 ## 维护
 

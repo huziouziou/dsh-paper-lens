@@ -164,19 +164,12 @@ export function pickSelection(scope, config = {}) {
 }
 
 /**
- * 跑一次翻译：把流读干，返回 { translation, chunkKinds, finishReason, failure }。
+ * 跑一次翻译，边收边通过 `onDelta` 推出去；返回汇总。
  *
- * 界面要求的是一次出（不流式），所以这里累加而不是边收边推。
- *
- * 分片形态做宽容处理：正常是 `{ type: 'text-delta', text }`，但如果适配器只给
- * `block-end` 的完整块，或换用 `kind` 作判别字段，也要能取到文字——否则模型明明
- * 答了，界面却只能报「没有返回译文」。同时把「看到了哪些分片、结束原因是什么」
- * 一并带回，失败时错误信息里就有可查的线索。
- *
- * `sessionId` 与官方压缩调用保持一致：适配器据此解析凭据与会话作用域，
- * 缺了它可能拿到 NO_ADAPTER / MISSING_CREDENTIAL 而非译文。
+ * 界面是流式的（边出边看），所以正常路径下 `out` 只是给调用方核对用的；
+ * 只有「模型没给出任何文字」时才用它判断失败。
  */
-export async function translateText(llm, selection, text, { maxChars = MAX_TRANSLATE_CHARS, sessionId } = {}) {
+export async function translateText(llm, selection, text, { maxChars = MAX_TRANSLATE_CHARS, sessionId, onDelta } = {}) {
   const clipped = String(text ?? '').slice(0, maxChars);
   let out = '';
   const chunkKinds = {};
@@ -195,12 +188,15 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
 
     if (kind === 'text-delta' && typeof chunk.text === 'string') {
       out += chunk.text;
+      if (chunk.text) onDelta?.(chunk.text);
     } else if (kind === 'block-end' && !out && chunk.block?.type === 'text' && typeof chunk.block.text === 'string') {
       out = chunk.block.text;
+      if (out) onDelta?.(out);
     } else if (kind !== 'finish' && kind !== 'reasoning-delta' && !out && typeof chunk?.text === 'string') {
       // 兜底只针对未知分片：reasoning-delta 也带 text，但那是模型的思考过程，
       // 一旦被当成译文，气泡里就会出现在想什么而不是译出来的东西。
       out += chunk.text;
+      if (chunk.text) onDelta?.(chunk.text);
     }
 
     if (kind === 'finish') {
@@ -211,6 +207,17 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
   }
 
   return { translation: out.trim(), chunkKinds, finishReason, failure };
+}
+
+/** 把失败原因拼成一行能查的说明：分片直方图 + 失败码 + 结束原因。 */
+function translateFailureText(selection, result) {
+  const kinds = Object.entries(result.chunkKinds).map(([k, n]) => `${k}×${n}`).join('、') || '无分片';
+  const code = result.failure?.code ?? '';
+  const message = result.failure?.message ?? '';
+  const status = result.failure?.status != null ? `HTTP ${result.failure.status}` : '';
+  const why = [code && `失败码 ${code}`, status, message, result.finishReason && `结束原因 ${result.finishReason}`]
+    .filter(Boolean).join('；') || '未给出结束原因';
+  return `模型没有返回译文（模型 ${selection.provider}/${selection.model}；收到 ${kinds}；${why}）`;
 }
 
 function sendJson(res, status, payload) {
@@ -365,26 +372,32 @@ export function apply(ctx, config = {}) {
       if (!selection) {
         return sendJson(res, 503, { error: '没有可用的默认模型：请先在设置里选一个，或在插件配置里写 provider/model' });
       }
+      // 流式：校验通过后就发头，之后一行一个 JSON 对象（NDJSON）：
+      //   {"delta":"…"}  增量文字
+      //   {"error":"…"}  失败（含分片直方图与失败码）
+      //   {"done":true}  正常结束
+      // 用 JSON 行而不是裸文本，因为译文里本来就有换行，裸文本没法区分"内容"与"结束"。
+      res.writeHead(200, {
+        'content-type': 'application/x-ndjson; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-accel-buffering': 'no',
+      });
+      const push = (payload) => {
+        try { res.write(`${JSON.stringify(payload)}\n`); } catch { /* 客户端已断开 */ }
+      };
       try {
-        const result = await translateText(llm, selection, text, { sessionId });
-        if (!result.translation) {
-          // 失败时把「看到过什么」带出来：分片种类直方图 + 结束原因 + 失败码与原文。
-          // 只说「模型没有返回译文」等于让人去猜。
-          const kinds = Object.entries(result.chunkKinds).map(([k, n]) => `${k}×${n}`).join('、') || '无分片';
-          const code = result.failure?.code ?? '';
-          const message = result.failure?.message ?? '';
-          const status = result.failure?.status != null ? `HTTP ${result.failure.status}` : '';
-          const why = [code && `失败码 ${code}`, status, message,
-            result.finishReason && `结束原因 ${result.finishReason}`].filter(Boolean).join('；')
-            || '未给出结束原因';
-          return sendJson(res, 502, {
-            error: `模型没有返回译文（模型 ${selection.provider}/${selection.model}；收到 ${kinds}；${why}）`,
-          });
-        }
-        return sendJson(res, 200, { translation: result.translation });
+        const result = await translateText(llm, selection, text, {
+          sessionId,
+          onDelta: (delta) => push({ delta }),
+        });
+        if (!result.translation) push({ error: translateFailureText(selection, result) });
+        else push({ done: true });
       } catch (error) {
-        return sendJson(res, 502, { error: `翻译失败：${error?.message ?? error}` });
+        push({ error: `翻译失败：${error?.message ?? error}` });
+      } finally {
+        try { res.end(); } catch { /* 已经结束 */ }
       }
+      return undefined;
     },
   });
   if (config.routes !== false && typeof ctx.inject === 'function') {

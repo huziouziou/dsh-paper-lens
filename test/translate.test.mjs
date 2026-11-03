@@ -74,6 +74,40 @@ test('pickSelection prefers an explicit provider/model over the app default', ()
   assert.equal(pickSelection({ get: () => undefined }, {}), null);
 });
 
+test('deltas are pushed out in order, so the bubble can stream them', async () => {
+  const llm = fakeLlm([
+    { type: 'text-delta', index: 0, text: '第一段。' },
+    { type: 'text-delta', index: 0, text: '第二段。' },
+    { type: 'finish', reason: 'stop' },
+  ]);
+  const seen = [];
+  const out = await translateText(llm, selection, 'x', { onDelta: (d) => seen.push(d) });
+  assert.deepEqual(seen, ['第一段。', '第二段。']);
+  assert.equal(out.translation, '第一段。第二段。');
+});
+
+test('a block-end-only stream still reaches the bubble as one delta', async () => {
+  const llm = fakeLlm([
+    { type: 'block-end', index: 0, block: { type: 'text', text: '整块到了。' } },
+    { type: 'finish', reason: 'stop' },
+  ]);
+  const seen = [];
+  await translateText(llm, selection, 'x', { onDelta: (d) => seen.push(d) });
+  assert.deepEqual(seen, ['整块到了。']);
+});
+
+test('reasoning text never reaches the bubble', async () => {
+  const llm = fakeLlm([
+    { type: 'reasoning-delta', index: 0, text: '先想想……' },
+    { type: 'text-delta', index: 0, text: '译文。' },
+    { type: 'finish', reason: 'stop' },
+  ]);
+  const seen = [];
+  const out = await translateText(llm, selection, 'x', { onDelta: (d) => seen.push(d) });
+  assert.deepEqual(seen, ['译文。']);
+  assert.equal(out.translation, '译文。');
+});
+
 test('the translate cap is bounded', () => {
   assert.ok(MAX_TRANSLATE_CHARS >= 1000 && MAX_TRANSLATE_CHARS <= 20000);
 });
