@@ -32,16 +32,20 @@ export const registry = new ViewerRegistry();
 
 const STYLE_ID = 'dsh-paper-lens-style';
 const CSS = [
-  '.dpa-root{display:flex;flex-direction:column;min-height:100%;background:var(--dsw-alias-bg-secondary,#2a2a2c)}',
+  // 用 DSH 真正定义的主题变量。`--dsw-alias-bg-primary` / `bg-secondary` 在 DSH 里不存在，
+  // 之前靠深色兜底值显示成黑条，浅色主题下深色文字压在黑底上，整排按钮几乎看不见。
+  '.dpa-root{display:flex;flex-direction:column;min-height:100%;background:var(--dsw-alias-bg-document-preview,#f3f4f6)}',
   '.dpa-root.dpa-own-scroll{height:100%;overflow:auto}',
   '.dpa-bar{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:6px;padding:6px 10px;font-size:12px;'
-    + 'background:var(--dsw-alias-bg-primary,#1f1f20);border-bottom:1px solid var(--dsw-alias-separator-primary,rgba(255,255,255,.1));color:var(--dsw-alias-label-primary,#e8e8ea)}',
-  '.dpa-bar input{width:44px;text-align:right;background:transparent;color:inherit;border:1px solid rgba(128,128,128,.4);border-radius:5px;padding:2px 4px;font:inherit}',
-  '.dpa-btn{border:1px solid rgba(128,128,128,.35);background:transparent;color:inherit;border-radius:6px;padding:2px 8px;cursor:pointer;font:inherit}',
-  '.dpa-btn:hover{background:rgba(128,128,128,.18)}',
+    + 'background:var(--dsw-alias-bg-document-preview,#f3f4f6);border-bottom:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));color:var(--dsw-alias-label-primary,#1f2937)}',
+  '.dpa-bar input{width:46px;text-align:center;background:var(--dsw-alias-bg-layer-1,rgba(255,255,255,.7));color:inherit;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));border-radius:5px;padding:2px 4px;font:inherit;font-variant-numeric:tabular-nums}',
+  '.dpa-btn{border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));background:var(--dsw-alias-bg-layer-1,rgba(255,255,255,.6));color:inherit;border-radius:6px;padding:2px 8px;cursor:pointer;font:inherit}',
+  '.dpa-btn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.18))}',
+  '.dpa-btn:disabled{opacity:.45;cursor:default}',
+  '.dpa-count{opacity:.8;white-space:nowrap;font-variant-numeric:tabular-nums}',
   '.dpa-spacer{flex:1}',
   '.dpa-note{opacity:.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-  '.dpa-note.dpa-err{color:#ff7b72;opacity:1}',
+  '.dpa-note.dpa-err{color:var(--dsw-alias-state-error-primary,#dc2626);opacity:1}',
   '.dpa-pages{display:flex;flex-direction:column;align-items:center;gap:14px;padding:16px 16px 40px}',
   '.dpa-page{position:relative;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.35);flex:none;cursor:text;contain:layout paint}',
   // A page still loading: a soft grey shimmer instead of a blank white box.
@@ -84,7 +88,7 @@ const CSS = [
   '.dpa-tr-head button{border:none;background:transparent;color:inherit;cursor:pointer;font:inherit;line-height:1;padding:2px 6px;border-radius:5px}',
   '.dpa-tr-head button:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.16))}',
   '.dpa-tr-body{padding:10px 12px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:var(--dsw-alias-label-primary,#1f2937)}',
-  '.dpa-tr-body.dpa-err{color:#dc2626}',
+  '.dpa-tr-body.dpa-err{color:var(--dsw-alias-state-error-primary,#dc2626)}',
   '.dpa-tr-body.dpa-tr-loading{opacity:.9}',
   '.dpa-tr-caret{display:inline-block;width:2px;height:1em;margin-left:1px;vertical-align:text-bottom;background:currentColor;animation:dpa-blink 1s steps(1) infinite}',
   '@keyframes dpa-blink{0%,50%{opacity:1}50.01%,100%{opacity:0}}',
@@ -509,6 +513,17 @@ function PdfAskBody(props) {
 
   const view = viewRef.current;
   const ready = status.phase === 'ready';
+  /** 跳到输入框里的页码；超出总页数时夹到最后一页，并把输入框改回真实页码。 */
+  const goToPage = (raw) => {
+    const target = Math.floor(Number(raw));
+    if (!Number.isFinite(target) || target < 1) {
+      setPageInput(String(page));
+      return;
+    }
+    const bounded = Math.min(target, status.pages ?? target);
+    view?.scrollToPage(bounded);
+    setPageInput(String(bounded));
+  };
   const zoom = (z) => {
     if (!view) return;
     if (z === 'fit') view.setZoom('fit');
@@ -549,14 +564,15 @@ function PdfAskBody(props) {
       h('input', {
         value: pageInput,
         'aria-label': '页码',
+        title: '输入页码后按回车（或点开别处）跳到该页',
         disabled: !ready,
         onChange: (event) => setPageInput(event.target.value.replace(/[^0-9]/g, '')),
         onKeyDown: (event) => {
-          if (event.key === 'Enter') view?.scrollToPage(Number(pageInput) || 1);
+          if (event.key === 'Enter') goToPage(pageInput);
         },
-        onBlur: () => setPageInput(String(page)),
+        onBlur: () => goToPage(pageInput),
       }),
-      h('span', null, ready ? `/ ${status.pages}` : ''),
+      h('span', { className: 'dpa-count' }, ready ? `/ ${status.pages} 页` : ''),
       h('span', { className: 'dpa-spacer' }),
       note ? h('span', { className: `dpa-note${note.error ? ' dpa-err' : ''}`, title: note.text }, note.text) : h('span', { className: 'dpa-note' }, '选中文字即可翻译、引用或提问'),
       h('span', { className: 'dpa-spacer' }),

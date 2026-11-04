@@ -343,7 +343,7 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  // 划词翻译：POST { text } → { translation }，一次性返回，不流式。
+  // 划词翻译：POST { text } → NDJSON 流（{delta} / {error} / {done}）。
   // 这里硬依赖 llm 服务；没有它时这条路由不挂载，插件的引用/链接功能照常工作。
   const translateRoute = (scope) => scope.webServer.register({
     kind: 'exact',

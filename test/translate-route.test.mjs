@@ -170,3 +170,48 @@ test('the stream call carries the session id the client sent', async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('each delta reaches the response while the model is still generating', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dpl-route-'));
+  try {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const handler = harness({
+      stream() {
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: '第一段' };
+          await gate;
+          yield { type: 'text-delta', index: 0, text: '第二段' };
+          yield { type: 'finish', reason: 'stop' };
+        })();
+      },
+    }, join(dir, 'state.json'));
+
+    const req = {
+      method: 'POST',
+      url: TRANSLATE,
+      async* [Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ text: 'Hello.' }), 'utf8'); },
+    };
+    const out = { status: null, headers: null, chunks: [], ended: false };
+    const res = {
+      writeHead(status, headers) { out.status = status; out.headers = headers; },
+      write(text) { out.chunks.push(text); return true; },
+      end() { out.ended = true; },
+    };
+    const running = handler(req, res);
+
+    // 第一段必须已经写出，而生成器还卡在 gate 上：这能区别「边收边写」和「收完再写」。
+    for (let i = 0; i < 100 && out.chunks.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.deepEqual(lines(out), [{ delta: '第一段' }]);
+    assert.equal(out.ended, false, '流应该还开着，模型还没生成完');
+
+    release();
+    await running;
+    assert.deepEqual(lines(out), [{ delta: '第一段' }, { delta: '第二段' }, { done: true }]);
+    assert.equal(out.ended, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

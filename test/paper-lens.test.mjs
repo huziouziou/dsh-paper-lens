@@ -151,6 +151,17 @@ test('the bundle registers an external-band .pdf preview with a body, using only
   assert.ok(client.exports.inject.includes('sessions') && client.exports.inject.includes('conversation'));
 });
 
+// 阅读器顶栏曾经用 `--dsw-alias-bg-primary` / `bg-secondary`，DSH 根本没有这两个变量，
+// 于是落到深色兜底值，浅色主题下深色字压在黑条上，整排按钮看不清。
+test('the PDF bar uses the host document-preview surface, not token names dsh never defines', () => {
+  const source = readFileSync(join(here, '../src/client/index.js'), 'utf8');
+  // 注释里可以写这两个旧名字（解释为什么换掉），规则本身不能再用。
+  const code = source.replace(/^\s*\/\/.*$/gm, '');
+  assert.match(code, /--dsw-alias-bg-document-preview/);
+  assert.doesNotMatch(code, /--dsw-alias-bg-primary\b/);
+  assert.doesNotMatch(code, /--dsw-alias-bg-secondary\b/);
+});
+
 test('a named citation finds its chat on both dsh lines, and says so when there is none', () => {
   const client = loadClient();
   const opened = [];

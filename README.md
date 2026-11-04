@@ -73,6 +73,7 @@ git diff v0.1.0 HEAD -- src      # 两版之间的代码差异
 |---|---|
 | `v0.1.0` | 首个可用版：划词翻译（一次出）、界面中文化、引用/提问的会话兜底修复、自绘图标 |
 | `v0.2.0` | 翻译改流式 + 气泡可拖动 + 翻译路由契约测试 |
+| `v0.2.1` | 修复阅读器顶栏黑底黑字（改用 DSH 真实主题变量）、页码框可读性与回车跳页；补「边收边写」与主题 token 回归测试 |
 
 ## 开发
 
@@ -80,7 +81,7 @@ git diff v0.1.0 HEAD -- src      # 两版之间的代码差异
 cd D:\AgentTools\Projects\dsh-paper-lens
 npm install          # 只装 esbuild 与 pdfjs-dist（devDependencies）
 npm run build        # src/client/* -> lib/client.js（约 1.7 MB，内嵌 pdf.js 与 worker）
-npm test             # 16 个用例，含一个真的加载 lib/client.js 的用例
+npm test             # 35 个用例，含一个真的加载 lib/client.js 的用例
 ```
 
 **改完 `src/client/**` 必须 `npm run build`**——`lib/client.js` 是生成物，直接改它会在下次构建时被覆盖。
