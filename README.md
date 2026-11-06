@@ -42,15 +42,14 @@ DSH `0.2.1-rc.5` 起，桌面的 `desktop` profile 只能由应用自己管理�
 
 打开任意 PDF（会话的「文件」页签里点开），它会在右侧边栏渲染。
 
-选中一段文字后，工具条给出五个动作：
+选中一段文字后，工具条给出四个动作：
 
 | 按钮 | 作用 |
 |---|---|
-| **译** | 翻成简体中文，**边翻边出**（流式），结果只显示译文；公式/变量名/数字/单位保持原样。气泡可**按住标题栏拖动** |
+| **译** | 翻成简体中文，**边收边出**（流式），结果只显示译文；公式/变量名/数字/单位保持原样。气泡可**按住标题栏拖动** |
 | 引用 | 把这段带 `文件 · p.N` 引用到当前会话输入框 |
-| 提问 | 引用后把光标放到「问题：」后面 |
-| 解释 | 引用后请模型解释这段在论文里的作用 |
-| 挑错 | 引用后请模型检查这段有无无依据的说法 |
+| ▾ | 带提示词引用：提问 / 解释 / 挑错（内容可配置，见下）。也可以**长按「引用」**打开同一个菜单 |
+| 标注 | 选一种颜色标在页面上，存进 PDF 同级的 `marks/` |
 
 `/cite-links` 让当前会话把每条关于论文的论断都链到 PDF（可 `on` / `off` / `status`）。
 
@@ -75,6 +74,7 @@ git diff v0.1.0 HEAD -- src      # 两版之间的代码差异
 | `v0.2.0` | 翻译改流式 + 气泡可拖动 + 翻译路由契约测试 |
 | `v0.2.1` | 修复阅读器顶栏黑底黑字（改用 DSH 真实主题变量）、页码框可读性与回车跳页；补「边收边写」与主题 token 回归测试 |
 | `v0.3.0` | 工具条合并为「引用」+ 可选预设提示词（配置可改）；PDF 批注（标色/查看/删除/转引用，存 `marks/`）；翻译缓存、提前 flush、动态 maxTokens、按段并行；字号与气泡宽度设置 |
+| `v0.3.1` | 修批注 cwd（`agent/session-start` → `agent/created`）；修翻译 max-tokens（推理预算 + 截断检测）；修顶栏换行；新增阅读器主题（跟随应用/浅色/深色） |
 
 ## 开发
 
@@ -154,18 +154,23 @@ upstream-cite-lens-0.3.1/   上游原始快照，仅作对照，勿改
 
   `pageIndex` 从 0 开始，`rect` / `segmentRects` 是页内比例（0–1），缩放不影响。相对 PDF 路径按会话 `cwd` 解析，越出工作区的路径会被拒绝。
 
+  **会话 `cwd` 怎么拿**：`agent/created` 事件（dsh 0.2.2 起的生命周期事件，0.2.1 及更早叫 `agent/session-start`，两个都挂）记下 session → agent；取不到时退回 `ctx.agents.get(id)` 与 `ctx.sessions.get(id)` 的 `header.cwd`。这三条路都断了才会报「PDF 路径缺失或越出会话工作区」。
+
 ### 显示设置
 
-顶栏「设置」可调**译文字号**（11–20px）和**气泡宽度**（280–640px），改动立即生效并写入 `localStorage` 的 `dsh-paper-lens:ui`，重启后保留。
+顶栏「设置」可调**主题**（跟随应用 / 浅色 / 深色）、**译文字号**（11–20px）和**气泡宽度**（280–640px），改动立即生效并写入 `localStorage` 的 `dsh-paper-lens:ui`，重启后保留。
+
+主题只改阅读器自己：PDF 纸面仍是白的，顶栏、批注面板、译文气泡跟着换色。皮肤插件会在后代元素上重声明 `--dsw-alias-*`，所以这几个面板按主题直接上色，不依赖变量继承。
 
 ### 翻译提速
 
 - 先量基线：1129 字符段落（真实 DSH + 模型）`fetch` 等到响应头 8.6s、首 delta 8.6s、整段 10.2s、57 个分片。
-- 改进：
-  - **提前 flush**：`writeHead` 后立即 `flushHeaders()`，`fetch` 不必等模型首 token。
-  - **同选区缓存**：`provider/model + 原文` 作键，最多 48 条；命中时直接回一条 `{delta}` + `{done}`，响应头带 `x-dpl-cache: hit`。
-  - **动态 maxTokens**：`max(512, len * 1.6)` 且不超过 4096，短句不再要 4096。
-  - **按段并行**：300 字符以上且有空行分段时，最多 3 段并行请求；第一段实时出字，其余按顺序补，不改变阅读顺序。
+- **关推理**：翻译不需要思考，但推理分片同样吃 `maxTokens` —— 实测短段落只剩半句、长段落直接 `max-tokens`。现在先带 `reasoningEffort`（默认 `off`）试，provider 拒绝就退回不带 effort、预算抬到 ≥2048。配置 `translateReasoning` 可改（`low` / `false` / 删掉即默认）。
+- **截断不上屏**：`max-tokens` / `length` 结束的译文一律报「译文被截断」，不缓存、不显示半句。
+- **同选区缓存**：`provider/model + 原文` 作键，最多 48 条；命中时直接回一条 `{delta}` + `{done}`，响应头带 `x-dpl-cache: hit`。
+- **动态 maxTokens**：`max(512, len * 1.6)` 且不超过 4096。
+- **按段并行**：300 字符以上且有空行分段时，最多 3 段并行请求；第一段实时出字，其余按顺序补，不改变阅读顺序。（PDF 选区多为单换行，实际很少触发。）
+- 提前 `flushHeaders()` 对 HTTP 直连有效（实测 54ms 回头），但桌面端的 `dsh-app://` 协议会缓冲整段响应，应用里看不到「边翻边出」——这是宿主的。
 
 ### 翻译是怎么实现的
 
@@ -189,7 +194,9 @@ upstream-cite-lens-0.3.1/   上游原始快照，仅作对照，勿改
 
 ## 维护
 
-- **DSH 升级后要先验证**：本插件依赖 5 个客户端服务（`slots`、`documentPreviews`、`sessions`、`conversation`、`sidebarRight`）和 1 个服务端服务（`llm`）。内核改接口时这里最可能先坏。
+- **DSH 升级后要先验证**：本插件依赖 5 个客户端服务（`slots`、`documentPreviews`、`sessions`、`conversation`、`sidebarRight`）和服务端 `llm`、`webServer`、`agents`、`sessions`。内核改接口时这里最可能先坏。
+- **事件名是暗坑**：v0.3.0 用 `agent/session-start`，dsh 0.2.2 改名成 `agent/created` 后**没有任何报错**——引用指南不再注入、批注相对路径全部 400。升级内核后优先核对 `ctx.on(...)` 的名字（`cordis_inspect_query` 的 Event provider 能列出真实事件与签名）。
+- **改 JSON 清单别用 PowerShell 的 `Set-Content -Encoding UTF8`**：会写 BOM，应用直接报「包不可用」。用 `[System.IO.File]::WriteAllText` + `UTF8Encoding($false)`。
 - **不跟随上游**：上游有修 bug 时，手动对照 `upstream-cite-lens-0.3.1/` 搬过来。
 - **回退**：卸载（设置 → 插件 → 卸载）后重装上一版本即可；本目录即源码，删掉 `node_modules` 与 `lib/client.js` 可完全重建。
 
