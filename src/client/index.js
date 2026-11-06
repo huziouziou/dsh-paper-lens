@@ -15,7 +15,7 @@ import TEXT_LAYER_CSS from '../textlayer.css';
 import { CiteLinksHeaderButton, CHIP_CSS, lastSessionId } from './chip.js';
 import { DEFAULT_PROMPTS } from '../prompts.js';
 import { DEFAULT_PREFS, FONT_RANGE, THEMES, WIDTH_RANGE, loadPrefs, savePrefs } from './prefs.js';
-import { MARK_COLORS, deleteMark, loadMarks, markFromSelection, saveMark } from './marks.js';
+import { MARK_COLORS, deleteMark, loadMarks, markFromSelection, saveMark, updateMarkNote } from './marks.js';
 
 const h = React.createElement;
 const { useEffect, useRef, useState, useCallback } = React;
@@ -129,6 +129,9 @@ const CSS = [
   '.dpa-mark-body{flex:1;min-width:0}',
   '.dpa-mark-quote{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}',
   '.dpa-mark-meta{opacity:.6;font-size:11px;margin-top:2px}',
+  '.dpa-mark-note{margin-top:4px;padding:3px 6px;border-left:3px solid currentColor;opacity:.85;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}',
+  '.dpa-note-input{width:100%;box-sizing:border-box;margin:2px 0 8px;padding:6px 8px;border-radius:6px;resize:vertical;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));background:var(--dsw-alias-bg-layer-1,rgba(255,255,255,.6));color:inherit;font:inherit;font-size:12px;line-height:1.45}',
+  '.dpa-note-input:focus{outline:1px solid var(--dsw-alias-state-business-primary,#2563eb);outline-offset:0}',
   '.dpa-mark-actions{display:flex;gap:4px;margin-top:4px}',
   '.dpa-mark-actions button,.dpa-panel button.dpa-small{border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));background:transparent;color:inherit;border-radius:5px;padding:1px 7px;font:inherit;font-size:11px;cursor:pointer}',
   '.dpa-mark-actions button:hover,.dpa-panel button.dpa-small:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.16))}',
@@ -306,6 +309,8 @@ function PdfAskBody(props) {
   const [marks, setMarks] = useState([]);
   const [marksOpen, setMarksOpen] = useState(false);
   const [markDetail, setMarkDetail] = useState(null);
+  /** 详情卡里正在编辑的文字批注；保存前只活在组件里。 */
+  const [noteDraft, setNoteDraft] = useState('');
   /** 字号与气泡宽度，localStorage 持久化。 */
   const [prefs, setPrefs] = useState(() => loadPrefs());
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -363,7 +368,7 @@ function PdfAskBody(props) {
         .then((list) => {
           if (cancelled) return;
           setMarks(list);
-          view.setMarks(list, (mark, event) => setMarkDetail({ mark, x: event.clientX, y: event.clientY }));
+          view.setMarks(list, (mark, event) => openMark(mark, event));
         })
         .catch(() => { /* no marks file, or no session yet: start empty */ });
       const remembered = memory.get(address)?.page;
@@ -618,7 +623,10 @@ function PdfAskBody(props) {
   /** The session whose workspace owns this PDF; its address is more reliable than the open chat. */
   const marksSession = () => sessionOfAddress(address) ?? currentSessionId(rootCtx) ?? lastSessionId();
 
-  const openMark = (mark, event) => setMarkDetail({ mark, x: event?.clientX ?? 160, y: event?.clientY ?? 120 });
+  const openMark = (mark, event) => {
+    setNoteDraft(mark?.custom?.note ?? '');
+    setMarkDetail({ mark, x: event?.clientX ?? 160, y: event?.clientY ?? 120 });
+  };
 
   const drawMarks = (list) => {
     setMarks(list);
@@ -660,21 +668,43 @@ function PdfAskBody(props) {
       return;
     }
     const session = marksSession();
+    // 弹卡片的位置：选区左下角；卡片会被 markDetailStyle 收回窗口内。
+    const anchor = { x: pop.rect?.left ?? 160, y: pop.rect?.bottom ?? 120 };
     try {
       const saved = await saveMark({ session, path: pathOfAddress(address), mark });
       drawMarks([...marks, saved]);
-      say(`已保存第 ${pop.page} 页批注`);
+      setNoteDraft('');
+      setMarkDetail({ mark: saved, ...anchor });
+      say(`已保存第 ${pop.page} 页批注，可继续写文字`);
       clearSelection();
     } catch (error) {
       say(`批注没保存：${error?.message ?? error}`, true);
     }
   };
 
-  /** An annotation's text as a normal quote in the chat. */
+  /** Save (or clear, when the box is empty) the text note of the open mark. */
+  const saveNote = async () => {
+    if (!markDetail) return;
+    const session = marksSession();
+    try {
+      const updated = await updateMarkNote({ session, path: pathOfAddress(address), id: markDetail.mark.id, note: noteDraft });
+      drawMarks(marks.map((m) => (m.id === updated.id ? updated : m)));
+      setMarkDetail({ ...markDetail, mark: updated });
+      say(updated.custom?.note ? '批注文字已保存' : '批注文字已清空');
+    } catch (error) {
+      say(`批注文字没保存：${error?.message ?? error}`, true);
+    }
+  };
+
+  /** An annotation's text as a normal quote in the chat; its note rides along. */
   const quoteAnnotation = (mark) => {
     if (!mark) return;
-    const block = formatQuote({ file, page: mark.pageIndex + 1, text: mark.custom?.quote });
-    insertBlock(block, `已引用第 ${mark.pageIndex + 1} 页的批注到会话`);
+    const base = formatQuote({ file, page: mark.pageIndex + 1, text: mark.custom?.quote });
+    const note = String(mark.custom?.note ?? '').trim();
+    const block = note ? `${base}注：${note}\n` : base;
+    insertBlock(block, note
+      ? `已引用第 ${mark.pageIndex + 1} 页的批注（带文字）到会话`
+      : `已引用第 ${mark.pageIndex + 1} 页的批注到会话`);
   };
 
   const removeAnnotation = async (mark) => {
@@ -944,6 +974,9 @@ function PdfAskBody(props) {
                   'div',
                   { className: 'dpa-mark-body' },
                   h('div', { className: 'dpa-mark-quote' }, mark.custom?.quote ?? ''),
+                  mark.custom?.note
+                    ? h('div', { className: 'dpa-mark-note' }, mark.custom.note)
+                    : null,
                   h('div', { className: 'dpa-mark-meta' }, `p.${mark.pageIndex + 1}`),
                   h(
                     'div',
@@ -952,6 +985,10 @@ function PdfAskBody(props) {
                       type: 'button',
                       onClick: (event) => { event.stopPropagation(); quoteAnnotation(mark); },
                     }, '引用'),
+                    h('button', {
+                      type: 'button',
+                      onClick: (event) => { event.stopPropagation(); openMark(mark, { clientX: event.clientX, clientY: event.clientY }); },
+                    }, mark.custom?.note ? '改文字' : '写文字'),
                     h('button', {
                       type: 'button',
                       onClick: (event) => { event.stopPropagation(); removeAnnotation(mark); },
@@ -1032,9 +1069,24 @@ function PdfAskBody(props) {
             h('button', { type: 'button', title: '关闭', onClick: () => setMarkDetail(null) }, '×'),
           ),
           h('div', { className: 'dpa-mark-quote' }, markDetail.mark.custom?.quote ?? ''),
+          h('textarea', {
+            className: 'dpa-note-input',
+            value: noteDraft,
+            rows: 3,
+            maxLength: 2000,
+            placeholder: '给这条批注写点文字（可留空，Ctrl/⌘+Enter 保存）',
+            onChange: (event) => setNoteDraft(event.target.value),
+            onKeyDown: (event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                event.preventDefault();
+                saveNote();
+              }
+            },
+          }),
           h(
             'div',
             { className: 'dpa-mark-actions' },
+            h('button', { type: 'button', onClick: () => saveNote() }, noteDraft.trim() ? '保存文字' : '清空文字'),
             h('button', { type: 'button', onClick: () => quoteAnnotation(markDetail.mark) }, '引用'),
             h('button', { type: 'button', onClick: () => removeAnnotation(markDetail.mark) }, '删除'),
             h('button', { type: 'button', onClick: () => revealMark(markDetail.mark) }, '定位'),

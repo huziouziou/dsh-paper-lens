@@ -18,7 +18,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { addMark, MARK_COLORS, pdfExists, readMarks, removeMark, resolvePdfPath } from './marks.js';
+import { addMark, MARK_COLORS, pdfExists, readMarks, removeMark, resolvePdfPath, updateMarkNote } from './marks.js';
 import { promptsForConfig } from './prompts.js';
 
 export const name = 'dsh-paper-lens';
@@ -503,6 +503,7 @@ export function apply(ctx, config = {}) {
   // 批注：PDF 同级的 marks/<name>.marks.json。
   //   GET    ?session=…&path=…            → { marks }
   //   POST   { session, path, mark }      → { mark }
+  //   PATCH  { session, path, id, note }  → { mark }（改文字批注；空串=清掉）
   //   DELETE ?session=…&path=…&id=…       → { ok: true }
   const marksRoute = (web) => web.register({
     kind: 'exact',
@@ -511,7 +512,7 @@ export function apply(ctx, config = {}) {
       const method = (req.method || 'GET').toUpperCase();
       const url = new URL(req.url ?? '/', 'http://x');
       let body = null;
-      if (method === 'POST') {
+      if (method === 'POST' || method === 'PATCH') {
         body = await readJson(req, 128 * 1024);
         if (!body) return sendJson(res, 400, { error: '请求体需要 JSON' });
       }
@@ -534,6 +535,18 @@ export function apply(ctx, config = {}) {
           return sendJson(res, 500, { error: `批注没保存：${error?.message ?? error}` });
         }
       }
+      if (method === 'PATCH') {
+        const id = typeof body?.id === 'string' ? body.id : (url.searchParams.get('id') ?? '');
+        if (!id) return sendJson(res, 400, { error: '缺少 id' });
+        if (typeof body?.note !== 'string') return sendJson(res, 400, { error: 'note 必须是字符串（空串表示清空）' });
+        try {
+          const mark = updateMarkNote(pdfPath, id, body.note);
+          if (!mark) return sendJson(res, 404, { error: '没有这条批注' });
+          return sendJson(res, 200, { mark });
+        } catch (error) {
+          return sendJson(res, 500, { error: `批注文字没保存：${error?.message ?? error}` });
+        }
+      }
       if (method === 'DELETE') {
         const id = typeof body?.id === 'string' ? body.id : (url.searchParams.get('id') ?? '');
         if (!id) return sendJson(res, 400, { error: '缺少 id' });
@@ -544,7 +557,7 @@ export function apply(ctx, config = {}) {
           return sendJson(res, 500, { error: `批注没删掉：${error?.message ?? error}` });
         }
       }
-      return sendJson(res, 405, { error: '只支持 GET/POST/DELETE' });
+      return sendJson(res, 405, { error: '只支持 GET/POST/PATCH/DELETE' });
     },
   });
 

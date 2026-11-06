@@ -18,6 +18,8 @@ export const MARKS_DIR = 'marks';
 export const MARK_COLORS = Object.freeze(['#f59e0b', '#ef4444', '#22c55e', '#3b82f6']);
 const MAX_MARKS = 2000;
 const MAX_QUOTE = 4000;
+/** Longest text note a mark carries; matches the route body budget. */
+export const MAX_NOTE = 2000;
 
 /**
  * The PDF's absolute path, or null when it cannot be resolved safely.
@@ -85,7 +87,7 @@ export function normalizeMark(raw, now = Date.now()) {
     : [];
   const quote = String(raw.custom?.quote ?? raw.quote ?? '').trim().slice(0, MAX_QUOTE);
   if (!quote) return null;
-  const note = String(raw.custom?.note ?? raw.note ?? '').trim().slice(0, 2000);
+  const note = String(raw.custom?.note ?? raw.note ?? '').trim().slice(0, MAX_NOTE);
   const strokeColor = /^#[0-9a-f]{6}$/i.test(String(raw.strokeColor ?? ''))
     ? String(raw.strokeColor).toLowerCase()
     : MARK_COLORS[0];
@@ -136,6 +138,26 @@ export function removeMark(pdfPath, id) {
   if (next.length === marks.length) return false;
   writeMarks(pdfPath, next);
   return true;
+}
+
+/**
+ * Replace one mark's text note. An empty note removes the key entirely, so a
+ * mark that never had a note and one whose note was cleared look the same.
+ * Returns the stored mark, or null when no mark has that id.
+ */
+export function updateMarkNote(pdfPath, id, note) {
+  const marks = readMarks(pdfPath);
+  const index = marks.findIndex((m) => m.id === id);
+  if (index < 0) return null;
+  const text = String(note ?? '').trim().slice(0, MAX_NOTE);
+  const current = marks[index];
+  const updated = {
+    ...current,
+    custom: { quote: current.custom.quote, ...(text ? { note: text } : {}) },
+  };
+  marks[index] = updated;
+  writeMarks(pdfPath, marks);
+  return updated;
 }
 
 /** Whether the PDF exists; a mark next to a missing file is not useful. */

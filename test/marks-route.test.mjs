@@ -154,3 +154,39 @@ test('agent/created is the event dsh 0.2.2 sends, so a chat keeps its cwd', asyn
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('marks: PATCH sets, replaces and clears a text note', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dpl-marks-note-'));
+  try {
+    const pdf = join(dir, 'main.pdf');
+    writeFileSync(pdf, '%PDF-1.4\n');
+    const { routes } = harness();
+    const mark = {
+      pageIndex: 0,
+      rect: { x: 0.1, y: 0.2, w: 0.3, h: 0.04 },
+      strokeColor: '#3b82f6',
+      custom: { quote: 'A sentence.' },
+    };
+    const created = await call(routes[`${BASE}/marks`], { method: 'POST', body: { path: pdf, mark } });
+    const id = created.json.mark.id;
+
+    const patched = await call(routes[`${BASE}/marks`], { method: 'PATCH', body: { path: pdf, id, note: '  和第二节冲突  ' } });
+    assert.equal(patched.status, 200);
+    assert.equal(patched.json.mark.custom.note, '和第二节冲突');
+    assert.equal(patched.json.mark.custom.quote, 'A sentence.', '改文字不动引文');
+
+    const listed = await call(routes[`${BASE}/marks`], { url: `${BASE}/marks?path=${encodeURIComponent(pdf)}` });
+    assert.equal(listed.json.marks[0].custom.note, '和第二节冲突');
+
+    const cleared = await call(routes[`${BASE}/marks`], { method: 'PATCH', body: { path: pdf, id, note: '' } });
+    assert.equal(cleared.status, 200);
+    assert.equal('note' in cleared.json.mark.custom, false);
+
+    const missing = await call(routes[`${BASE}/marks`], { method: 'PATCH', body: { path: pdf, id: 'm-nope', note: 'x' } });
+    assert.equal(missing.status, 404);
+    const noNote = await call(routes[`${BASE}/marks`], { method: 'PATCH', body: { path: pdf, id } });
+    assert.equal(noNote.status, 400);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

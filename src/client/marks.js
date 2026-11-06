@@ -81,3 +81,14 @@ export async function deleteMark({ session, path, id, fetchImpl = fetch }) {
   await jsonOrThrow(response);
   return true;
 }
+
+/** Set (or clear, with an empty string) one mark's text note. */
+export async function updateMarkNote({ session, path, id, note, fetchImpl = fetch }) {
+  const response = await fetchImpl(`${BASE}/marks`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ session, path, id, note: String(note ?? '') }),
+  });
+  const data = await jsonOrThrow(response);
+  return data?.mark;
+}
