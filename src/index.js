@@ -214,34 +214,38 @@ export function pickSelection(scope, config = {}) {
  * 界面是流式的（边出边看），所以正常路径下 `out` 只是给调用方核对用的；
  * 只有「模型没给出任何文字」时才用它判断失败。
  */
-export async function translateText(llm, selection, text, { maxChars = MAX_TRANSLATE_CHARS, sessionId, onDelta, maxTokens } = {}) {
+export async function translateText(llm, selection, text, { maxChars = MAX_TRANSLATE_CHARS, sessionId, onDelta, maxTokens, reasoningEffort = 'off' } = {}) {
   const clipped = String(text ?? '').slice(0, maxChars);
   let out = '';
   const chunkKinds = {};
   let finishReason = '';
   let failure = null;
+  let emitted = false;
 
-  for await (const chunk of llm.stream({
+  const request = (extra = {}) => ({
     provider: selection.provider,
     model: selection.model,
     messages: [{ role: 'user', content: [{ type: 'text', text: translatePrompt(clipped) }] }],
     maxTokens: maxTokens ?? translationMaxTokens(clipped),
     ...(sessionId ? { sessionId } : {}),
-  })) {
+    ...extra,
+  });
+
+  const handle = (chunk) => {
     const kind = String(chunk?.type ?? chunk?.kind ?? 'unknown');
     chunkKinds[kind] = (chunkKinds[kind] ?? 0) + 1;
 
     if (kind === 'text-delta' && typeof chunk.text === 'string') {
       out += chunk.text;
-      if (chunk.text) onDelta?.(chunk.text);
+      if (chunk.text) { emitted = true; onDelta?.(chunk.text); }
     } else if (kind === 'block-end' && !out && chunk.block?.type === 'text' && typeof chunk.block.text === 'string') {
       out = chunk.block.text;
-      if (out) onDelta?.(out);
+      if (out) { emitted = true; onDelta?.(out); }
     } else if (kind !== 'finish' && kind !== 'reasoning-delta' && !out && typeof chunk?.text === 'string') {
       // 兜底只针对未知分片：reasoning-delta 也带 text，但那是模型的思考过程，
       // 一旦被当成译文，气泡里就会出现在想什么而不是译出来的东西。
       out += chunk.text;
-      if (chunk.text) onDelta?.(chunk.text);
+      if (chunk.text) { emitted = true; onDelta?.(chunk.text); }
     }
 
     if (kind === 'finish') {
@@ -249,10 +253,58 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
       finishReason = typeof reason === 'string' ? reason : String(reason?.kind ?? reason?.type ?? '');
     }
     if (chunk?.failure) failure = chunk.failure;
+  };
+
+  const run = async (extra) => {
+    for await (const chunk of llm.stream(request(extra))) handle(chunk);
+  };
+
+  // 译文不需要思考：推理分片同样吃 maxTokens，真机上短段落常常只剩半句、长段落
+  // 直接以 max-tokens 结束（一个文字分片都没有）。先按配置关掉推理。
+  //
+  // provider 拒绝某个 effort 有两种表现：抛 UNSUPPORTED_REASONING_EFFORT，或者干脆
+  // 用 finish(reason: 'error') 收尾（实测 opencode-go 对 'off' 是后者）。两种都在
+  // 「还没出过任何文字」时退回不带 effort 的调用，并把预算抬到 2048，免得再死在
+  // max-tokens 上。配置写 `translateReasoning: false` 则直接走退路，不试探。
+  const reset = () => {
+    out = '';
+    finishReason = '';
+    failure = null;
+    for (const key of Object.keys(chunkKinds)) delete chunkKinds[key];
+  };
+  const effort = reasoningEffort === false ? '' : String(reasoningEffort ?? 'off').trim();
+  let firstFailed = false;
+  if (effort) {
+    try {
+      await run({ reasoningEffort: effort });
+      firstFailed = !emitted && finishReason === 'error';
+    } catch (error) {
+      if (emitted || !isUnsupportedReasoningEffort(error)) throw error;
+      firstFailed = true;
+    }
+    if (firstFailed) reset();
+  }
+  if (firstFailed || !effort) {
+    await run({ maxTokens: Math.max(maxTokens ?? translationMaxTokens(clipped), 2048) });
   }
 
-  return { translation: out.trim(), chunkKinds, finishReason, failure };
+
+  return {
+    translation: out.trim(),
+    chunkKinds,
+    finishReason,
+    failure,
+    truncated: /max[-_]?tokens|length/i.test(String(finishReason)),
+  };
 }
+
+/** Whether this error means the provider does not take `reasoningEffort: 'off'`. */
+export function isUnsupportedReasoningEffort(error) {
+  const code = String(error?.code ?? '');
+  const message = String(error?.message ?? error ?? '');
+  return code === 'UNSUPPORTED_REASONING_EFFORT' || /does not support reasoning effort/i.test(message);
+}
+
 
 /** 把失败原因拼成一行能查的说明：分片直方图 + 失败码 + 结束原因。 */
 function translateFailureText(selection, result) {
@@ -263,6 +315,11 @@ function translateFailureText(selection, result) {
   const why = [code && `失败码 ${code}`, status, message, result.finishReason && `结束原因 ${result.finishReason}`]
     .filter(Boolean).join('；') || '未给出结束原因';
   return `模型没有返回译文（模型 ${selection.provider}/${selection.model}；收到 ${kinds}；${why}）`;
+}
+
+/** 半截译文：不要当成完整结果，也别写进缓存。 */
+function translateTruncatedText(result) {
+  return `译文被截断（结束原因 ${result.finishReason || 'max-tokens'}）：模型在预算用尽前只译出一部分。再点一次「译」重试，或缩小选区。`;
 }
 
 function sendJson(res, status, payload) {
@@ -293,10 +350,31 @@ export function apply(ctx, config = {}) {
   const added = new WeakSet();
 
   const sessionIdOf = (agent) => String(agent?.session?.id ?? '');
+  /**
+   * The live agent for a session, whichever way this host version exposes it.
+   *
+   * The event name changed under us: dsh 0.2.2 emits `agent/created` and has no
+   * `agent/session-start`, so a listener on the old name never ran — the
+   * citation guide was never added and a PDF's relative path had no session
+   * cwd to resolve against. The registry lookup is the safety net for sessions
+   * that were already live before this plugin mounted.
+   */
+  const liveAgent = (sessionId) => {
+    if (!sessionId) return undefined;
+    return agentBySession.get(sessionId) ?? service(ctx, 'agents')?.get?.(sessionId) ?? undefined;
+  };
   /** The session's workspace root, as dsh records it in the session header. */
   const cwdOf = (sessionId) => {
-    const agent = agentBySession.get(sessionId);
-    return agent?.session?.header?.cwd ?? agent?.session?.cwd ?? undefined;
+    if (!sessionId) return undefined;
+    const agent = liveAgent(sessionId);
+    const fromAgent = agent?.session?.header?.cwd ?? agent?.session?.cwd;
+    if (fromAgent) return fromAgent;
+    try {
+      // A session can be live without an agent (opened, no turn yet).
+      return service(ctx, 'sessions')?.get?.(sessionId)?.header?.cwd;
+    } catch {
+      return undefined;
+    }
   };
 
   function setModeSection(agentCtx, on) {
@@ -313,13 +391,23 @@ export function apply(ctx, config = {}) {
     return true;
   }
 
-  ctx.on?.('agent/session-start', (payload) => {
+  /** Keep the id -> agent/ctx maps current; returns false when the agent has no session. */
+  const rememberAgent = (agent) => {
+    const id = sessionIdOf(agent);
+    const agentCtx = agent?.ctx;
+    if (!id || !agentCtx) return false;
+    agentsBySession.set(id, agentCtx);
+    agentBySession.set(id, agent);
+    return true;
+  };
+
+  const onAgentStarted = (payload) => {
     const agent = payload?.agent;
     const agentCtx = agent?.ctx;
-    if (!agentCtx || added.has(agentCtx)) return;
+    if (!agentCtx) return;
+    rememberAgent(agent);
+    if (added.has(agentCtx)) return;
     added.add(agentCtx);
-    agentsBySession.set(sessionIdOf(agent), agentCtx);
-    agentBySession.set(sessionIdOf(agent), agent);
     try {
       const prompt = service(agentCtx, 'systemPrompt');
       if (typeof prompt?.section !== 'function') return;
@@ -332,7 +420,14 @@ export function apply(ctx, config = {}) {
     } catch (error) {
       ctx.logger?.warn?.(`dsh-paper-lens: citation guide not added to this chat: ${error?.message ?? error}`);
     }
-  });
+  };
+
+  // dsh 0.2.2 起是 agent/created（{ agent, source }）；0.2.1 及更早是
+  // agent/session-start。两个都挂：挂一个当前版本不发的名字只是永远不触发。
+  if (typeof ctx.on === 'function') {
+    ctx.on('agent/created', onAgentStarted);
+    ctx.on('agent/session-start', onAgentStarted);
+  }
 
   // With citation links on, every prompt the user sends goes in with a short
   // reminder beside it. Only on the step that carries the user's own new
@@ -536,13 +631,18 @@ export function apply(ctx, config = {}) {
           const tasks = groups.map((part, i) => translateText(llm, selection, part, {
             sessionId,
             maxTokens: translationMaxTokens(part),
+            reasoningEffort: config.translateReasoning,
             onDelta: i === 0 ? (delta) => push({ delta }) : (delta) => { buffers[i] += delta; },
           }));
           const first = await tasks[0];
           if (!first.translation) {
             push({ error: translateFailureText(selection, first) });
+          } else if (first.truncated) {
+            // 半截译文不能当成功：不缓存，也不显示，让用户重试或缩小选区。
+            push({ error: translateTruncatedText(first) });
           } else {
             let combined = first.translation;
+            let truncated = null;
             for (let i = 1; i < groups.length; i += 1) {
               const result = await tasks[i];
               if (!result.translation) {
@@ -550,10 +650,12 @@ export function apply(ctx, config = {}) {
                 combined = '';
                 break;
               }
+              if (result.truncated) { truncated = result; combined = ''; break; }
               push({ delta: `\n\n${result.translation}` });
               combined += `\n\n${result.translation}`;
             }
-            if (combined) {
+            if (truncated) push({ error: translateTruncatedText(truncated) });
+            else if (combined) {
               remember(combined);
               push({ done: true });
             }
@@ -562,9 +664,11 @@ export function apply(ctx, config = {}) {
           const result = await translateText(llm, selection, text, {
             sessionId,
             maxTokens: translationMaxTokens(text),
+            reasoningEffort: config.translateReasoning,
             onDelta: (delta) => push({ delta }),
           });
           if (!result.translation) push({ error: translateFailureText(selection, result) });
+          else if (result.truncated) push({ error: translateTruncatedText(result) });
           else {
             remember(result.translation);
             push({ done: true });

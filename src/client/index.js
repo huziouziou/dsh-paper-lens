@@ -14,7 +14,7 @@ import { ViewerRegistry, installPageLinks, HIGHLIGHT } from './pagelinks.js';
 import TEXT_LAYER_CSS from '../textlayer.css';
 import { CiteLinksHeaderButton, CHIP_CSS, lastSessionId } from './chip.js';
 import { DEFAULT_PROMPTS } from '../prompts.js';
-import { DEFAULT_PREFS, FONT_RANGE, WIDTH_RANGE, loadPrefs, savePrefs } from './prefs.js';
+import { DEFAULT_PREFS, FONT_RANGE, THEMES, WIDTH_RANGE, loadPrefs, savePrefs } from './prefs.js';
 import { MARK_COLORS, deleteMark, loadMarks, markFromSelection, saveMark } from './marks.js';
 
 const h = React.createElement;
@@ -49,6 +49,24 @@ const CSS = [
   '.dpa-spacer{flex:1}',
   '.dpa-note{opacity:.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
   '.dpa-note.dpa-err{color:var(--dsw-alias-state-error-primary,#dc2626);opacity:1}',
+  // 侧边栏窄的时候，按钮文字会被压成两行（「批 / 注」），提示文字反而占位。
+  // 按钮一律不换行、不收缩；提示文字自己让位并省略。
+  '.dpa-bar>*{flex:none}',
+  '.dpa-bar .dpa-note{flex:0 1 auto;min-width:0}',
+  '.dpa-bar .dpa-spacer{flex:1 1 8px}',
+  '.dpa-bar .dpa-btn{white-space:nowrap}',
+  // Theme: `auto` keeps the app's own variables; the other two pin the reader so a
+  // light app can still show a dark reader (and vice versa). Only this subtree is
+  // recoloured — the PDF paper itself stays white, like any reader.
+  '.dpa-root[data-dpa-theme=dark]{--dsw-alias-bg-document-preview:#111827;--dsw-alias-label-primary:#f3f4f6;--dsw-alias-border-l2:rgba(255,255,255,.2);--dsw-alias-bg-layer-1:rgba(255,255,255,.08);--dsw-alias-interactive-bg-hover:rgba(255,255,255,.16);--dsw-alias-bg-overlay:#1f2937;--dsw-alias-state-error-primary:#fca5a5;color-scheme:dark}',
+  '.dpa-root[data-dpa-theme=light]{--dsw-alias-bg-document-preview:#f3f4f6;--dsw-alias-label-primary:#1f2937;--dsw-alias-border-l2:rgba(0,0,0,.12);--dsw-alias-bg-layer-1:rgba(255,255,255,.6);--dsw-alias-interactive-bg-hover:rgba(128,128,128,.18);--dsw-alias-bg-overlay:#ffffff;--dsw-alias-state-error-primary:#dc2626;color-scheme:light}',
+  // The app's skin stylesheet re-declares these variables on descendants, so a
+  // panel/bubble does not inherit the reader's choice. Paint them directly.
+  '.dpa-root[data-dpa-theme=dark] .dpa-panel,.dpa-root[data-dpa-theme=dark] .dpa-tr,.dpa-root[data-dpa-theme=dark] .dpa-mark-detail{background:#1f2937;color:#f3f4f6;border-color:rgba(255,255,255,.2)}',
+  '.dpa-root[data-dpa-theme=light] .dpa-panel,.dpa-root[data-dpa-theme=light] .dpa-tr,.dpa-root[data-dpa-theme=light] .dpa-mark-detail{background:#ffffff;color:#1f2937;border-color:rgba(0,0,0,.14)}',
+  '.dpa-theme-row{display:flex;gap:6px;margin:2px 0 10px}',
+  '.dpa-theme-row button{flex:1;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));background:transparent;color:inherit;border-radius:6px;padding:4px 6px;font:inherit;font-size:11px;cursor:pointer}',
+  '.dpa-theme-row button[aria-pressed=true]{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.18));font-weight:600}',
   '.dpa-pages{display:flex;flex-direction:column;align-items:center;gap:14px;padding:16px 16px 40px}',
   '.dpa-page{position:relative;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.35);flex:none;cursor:text;contain:layout paint}',
   // A page still loading: a soft grey shimmer instead of a blank white box.
@@ -753,7 +771,7 @@ function PdfAskBody(props) {
 
   return h(
     'div',
-    { className: 'dpa-root', ref: rootRef, 'data-dsh-paper-lens': '' },
+    { className: 'dpa-root', ref: rootRef, 'data-dsh-paper-lens': '', 'data-dpa-theme': prefs.theme },
     h(
       'div',
       { className: 'dpa-bar' },
@@ -954,6 +972,16 @@ function PdfAskBody(props) {
             h('span', null, '显示设置'),
             h('span', { className: 'dpa-spacer' }),
             h('button', { type: 'button', title: '关闭', onClick: () => setSettingsOpen(false) }, '×'),
+          ),
+          h(
+            'div',
+            { className: 'dpa-theme-row', role: 'group', 'aria-label': '阅读器主题' },
+            THEMES.map((value) => h('button', {
+              key: value,
+              type: 'button',
+              'aria-pressed': prefs.theme === value ? 'true' : 'false',
+              onClick: () => changePrefs({ theme: value }),
+            }, value === 'auto' ? '跟随应用' : value === 'light' ? '浅色' : '深色')),
           ),
           h(
             'div',

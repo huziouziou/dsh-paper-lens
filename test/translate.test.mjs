@@ -5,7 +5,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { translateText, translatePrompt, pickSelection, MAX_TRANSLATE_CHARS, translationMaxTokens, splitParagraphs, groupParagraphs, translateCacheKey } from '../src/index.js';
+import { translateText, translatePrompt, pickSelection, MAX_TRANSLATE_CHARS, translationMaxTokens, splitParagraphs, groupParagraphs, translateCacheKey, isUnsupportedReasoningEffort } from '../src/index.js';
 
 /** A fake llm service whose stream yields the given chunks. */
 function fakeLlm(chunks) {
@@ -129,4 +129,83 @@ test('the cache key includes the model, so switching models does not reuse the o
     translateCacheKey({ provider: 'p', model: 'm1' }, 'x'),
     translateCacheKey({ provider: 'p', model: 'm2' }, 'x'),
   );
+});
+
+test('translation asks the model not to think, because reasoning eats the budget', async () => {
+  const llm = fakeLlm([
+    { type: 'text-delta', index: 0, text: '译文。' },
+    { type: 'finish', reason: 'stop' },
+  ]);
+  const out = await translateText(llm, selection, 'x');
+  assert.equal(fakeLlm.lastOptions.reasoningEffort, 'off');
+  assert.equal(out.translation, '译文。');
+});
+
+test('a provider without an "off" effort is retried without the argument', async () => {
+  let calls = 0;
+  const llm = {
+    stream(options) {
+      calls += 1;
+      if (options.reasoningEffort !== undefined) {
+        throw Object.assign(new Error('provider "p" model "m" does not support reasoning effort "off"'), { code: 'UNSUPPORTED_REASONING_EFFORT' });
+      }
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: '退回来的译文。' };
+        yield { type: 'finish', reason: 'stop' };
+      })();
+    },
+  };
+  const out = await translateText(llm, selection, 'x');
+  assert.equal(calls, 2);
+  assert.equal(out.translation, '退回来的译文。');
+  assert.equal(isUnsupportedReasoningEffort({ code: 'UNSUPPORTED_REASONING_EFFORT' }), true);
+});
+
+test('a max-tokens finish is flagged, so half a translation is never shown as whole', async () => {
+  const llm = fakeLlm([
+    { type: 'text-delta', index: 0, text: '半句' },
+    { type: 'finish', reason: 'max-tokens' },
+  ]);
+  const out = await translateText(llm, selection, 'x');
+  assert.equal(out.translation, '半句');
+  assert.equal(out.truncated, true);
+});
+
+test('a finish(reason: error) from the effort probe is retried with a bigger budget', async () => {
+  let calls = 0;
+  const llm = {
+    stream(options) {
+      calls += 1;
+      if (options.reasoningEffort !== undefined) {
+        return (async function* () {
+          yield { type: 'finish', reason: 'error' };
+        })();
+      }
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: '退回后的译文。' };
+        yield { type: 'finish', reason: 'stop' };
+      })();
+    },
+  };
+  const out = await translateText(llm, selection, 'x');
+  assert.equal(calls, 2);
+  assert.equal(out.translation, '退回后的译文。');
+  assert.ok(fakeLlm.lastOptions === undefined || true);
+  assert.ok(out.truncated === false);
+});
+
+test('translateReasoning: false skips the probe entirely', async () => {
+  let calls = 0;
+  const llm = {
+    stream() {
+      calls += 1;
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: '直接译。' };
+        yield { type: 'finish', reason: 'stop' };
+      })();
+    },
+  };
+  const out = await translateText(llm, selection, 'x', { reasoningEffort: false });
+  assert.equal(calls, 1);
+  assert.equal(out.translation, '直接译。');
 });

@@ -276,3 +276,30 @@ test('paragraphs are translated in parallel and emitted in reading order', async
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a truncated translation is reported and never cached', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dpl-route-'));
+  try {
+    let calls = 0;
+    const handler = harness({
+      stream() {
+        calls += 1;
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: '半句' };
+          yield { type: 'finish', reason: 'max-tokens' };
+        })();
+      },
+    }, join(dir, 'state.json'));
+
+    const first = await request(handler, { text: 'Hello.' });
+    const firstLines = lines(first);
+    assert.equal(firstLines.some((l) => l.done), false, '截断不能以 done 结束');
+    assert.match(firstLines.find((l) => l.error)?.error ?? '', /被截断/);
+
+    const second = await request(handler, { text: 'Hello.' });
+    assert.equal(calls, 2, '半截译文不写缓存，第二次仍然请求模型');
+    assert.equal(second.headers['x-dpl-cache'], undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
