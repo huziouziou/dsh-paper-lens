@@ -79,6 +79,8 @@ export class PdfView {
     this.frame = 0;
     this.lastScroll = { y: 0, t: 0, speed: 0 };
     this.settleTimer = null;
+    this.marks = [];
+    this.onMarkClick = null;
 
     this.resizeObserver = new ResizeObserver(() => {
       if (this.zoom === 'fit') this.relayout();
@@ -469,6 +471,63 @@ export class PdfView {
       setTimeout(() => mark.remove(), 3400);
     }
     setTimeout(() => page.el.classList.remove('dpa-flash'), 1600);
+  }
+
+  /**
+   * Draw stored annotations on their pages.
+   *
+   * They are page-relative percentages, so zooming and re-rendering the page
+   * text never needs to move them. The translucent bands are pointer-events:none
+   * (text selection still works through them); a small numbered badge at the
+   * first line opens the mark's popover.
+   */
+  setMarks(marks, onMarkClick) {
+    this.marks = Array.isArray(marks) ? marks : [];
+    this.onMarkClick = onMarkClick ?? null;
+    for (const page of this.pages) {
+      page.el.querySelectorAll('.dpa-anno, .dpa-anno-badge').forEach((el) => el.remove());
+    }
+    if (!this.marks.length || !this.pages.length) return;
+    const total = this.marks.length;
+    for (const [index, mark] of this.marks.entries()) {
+      const page = this.pages[mark.pageIndex];
+      if (!page) continue;
+      const boxes = Array.isArray(mark.segmentRects) && mark.segmentRects.length ? mark.segmentRects : [mark.rect];
+      for (const box of boxes) {
+        if (!box) continue;
+        const band = document.createElement('div');
+        band.className = 'dpa-anno';
+        band.style.left = `${box.x * 100}%`;
+        band.style.top = `${box.y * 100}%`;
+        band.style.width = `${box.w * 100}%`;
+        band.style.height = `${box.h * 100}%`;
+        band.style.background = mark.strokeColor;
+        band.title = mark.custom?.quote ?? '';
+        page.el.appendChild(band);
+      }
+      const first = boxes[0];
+      if (!first) continue;
+      const badge = document.createElement('button');
+      badge.type = 'button';
+      badge.className = 'dpa-anno-badge';
+      badge.textContent = String(index + 1);
+      badge.title = mark.custom?.quote ?? `第 ${mark.pageIndex + 1} 页批注`;
+      badge.setAttribute('aria-label', `批注 ${index + 1}：${badge.title}`);
+      badge.style.left = `${first.x * 100}%`;
+      badge.style.top = `${first.y * 100}%`;
+      badge.style.background = mark.strokeColor;
+      badge.addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      badge.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.onMarkClick?.(mark, event);
+      });
+      page.el.appendChild(badge);
+    }
+    this.container.dataset.marks = String(total);
   }
 
   dispose() {

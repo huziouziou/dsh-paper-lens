@@ -5,7 +5,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { translateText, translatePrompt, pickSelection, MAX_TRANSLATE_CHARS } from '../src/index.js';
+import { translateText, translatePrompt, pickSelection, MAX_TRANSLATE_CHARS, translationMaxTokens, splitParagraphs, groupParagraphs, translateCacheKey } from '../src/index.js';
 
 /** A fake llm service whose stream yields the given chunks. */
 function fakeLlm(chunks) {
@@ -110,4 +110,23 @@ test('reasoning text never reaches the bubble', async () => {
 
 test('the translate cap is bounded', () => {
   assert.ok(MAX_TRANSLATE_CHARS >= 1000 && MAX_TRANSLATE_CHARS <= 20000);
+});
+
+test('the token cap scales with the passage but never drops below 512', () => {
+  assert.equal(translationMaxTokens('short'), 512);
+  assert.equal(translationMaxTokens('x'.repeat(1129)), 1807);
+  assert.equal(translationMaxTokens('x'.repeat(10000)), 4096);
+});
+
+test('paragraph splitting only fires on real blank-line breaks', () => {
+  assert.deepEqual(splitParagraphs('one line\nstill same paragraph'), []);
+  assert.deepEqual(splitParagraphs('first paragraph\n\nsecond paragraph'), ['first paragraph', 'second paragraph']);
+  assert.deepEqual(groupParagraphs(['a', 'b', 'c', 'd'], 3), ['a\n\nb', 'c', 'd']);
+});
+
+test('the cache key includes the model, so switching models does not reuse the old text', () => {
+  assert.notEqual(
+    translateCacheKey({ provider: 'p', model: 'm1' }, 'x'),
+    translateCacheKey({ provider: 'p', model: 'm2' }, 'x'),
+  );
 });

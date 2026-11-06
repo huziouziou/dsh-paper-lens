@@ -74,6 +74,7 @@ git diff v0.1.0 HEAD -- src      # 两版之间的代码差异
 | `v0.1.0` | 首个可用版：划词翻译（一次出）、界面中文化、引用/提问的会话兜底修复、自绘图标 |
 | `v0.2.0` | 翻译改流式 + 气泡可拖动 + 翻译路由契约测试 |
 | `v0.2.1` | 修复阅读器顶栏黑底黑字（改用 DSH 真实主题变量）、页码框可读性与回车跳页；补「边收边写」与主题 token 回归测试 |
+| `v0.3.0` | 工具条合并为「引用」+ 可选预设提示词（配置可改）；PDF 批注（标色/查看/删除/转引用，存 `marks/`）；翻译缓存、提前 flush、动态 maxTokens、按段并行；字号与气泡宽度设置 |
 
 ## 开发
 
@@ -81,7 +82,7 @@ git diff v0.1.0 HEAD -- src      # 两版之间的代码差异
 cd D:\AgentTools\Projects\dsh-paper-lens
 npm install          # 只装 esbuild 与 pdfjs-dist（devDependencies）
 npm run build        # src/client/* -> lib/client.js（约 1.7 MB，内嵌 pdf.js 与 worker）
-npm test             # 35 个用例，含一个真的加载 lib/client.js 的用例
+npm test             # 60 个用例，含真的加载 lib/client.js 的用例
 ```
 
 **改完 `src/client/**` 必须 `npm run build`**——`lib/client.js` 是生成物，直接改它会在下次构建时被覆盖。
@@ -91,11 +92,15 @@ npm test             # 35 个用例，含一个真的加载 lib/client.js 的用
 ### 目录
 
 ```
-src/index.js          服务端：系统提示词注入、/cite-links、/translate 路由
+src/index.js          服务端：系统提示词注入、/cite-links、/translate、/config、/marks 路由
+src/prompts.js        预设提示词的默认值与配置归一化（两半共用）
+src/marks.js          批注的文件定位、校验、读写（<pdf-dir>/marks/*.marks.json）
 src/client/           浏览器半边（React + pdf.js）
-  index.js            预览体、工具条、翻译气泡、插槽注册
-  chat.js             划词动作定义、引用块格式、写入当前会话输入框
-  viewer.js           pdf.js 视图
+  index.js            预览体、工具条、翻译气泡、批注面板、显示设置、插槽注册
+  chat.js             引用块格式、写入当前会话输入框、`[p.N]` 解析
+  prefs.js            字号/气泡宽度：归一化与 localStorage 持久化
+  marks.js            批注的选区转格式、HTTP 客户端
+  viewer.js           pdf.js 视图、批注高亮与编号徽标
   selection.js        选区机制（pdf.js 文本层修正、手柄、键盘扩展）
   pagelinks.js        引用链接的渲染与跳转高亮
   textsearch.js       页内查找
@@ -104,6 +109,63 @@ build.mjs             esbuild 打包，输出 lib/client.js
 test/                 node --test 用例
 upstream-cite-lens-0.3.1/   上游原始快照，仅作对照，勿改
 ```
+
+### 引用工具条与预设提示词
+
+- 划词后只有「译」「引用」「标注」；「引用」是普通引用，点旁边的 `▾`（或**长按「引用」**）才展开预设提示词（提问 / 解释 / 挑错）。
+- 预设内容走插件配置，不写死在界面里。可以在 profile 的 `cordis.patch.yml` 里按 id 覆盖：
+
+  ```yaml
+  - id: dsh-paper-lens
+    name: "dsh-paper-lens"
+    config:
+      prompts:
+        - id: ask
+          label: 提问
+          prompt: "问题："
+        - id: explain
+          label: 解释
+          prompt: "解释这段：它说了什么，为什么重要。"
+  ```
+
+  `prompts: []` 会关掉预设，只保留普通引用。改完重启 DSH；客户端从 `GET /plugin-data/dsh-paper-lens/config` 读取。
+
+### 批注
+
+- 划词 → 「标注」→ 选颜色，立即保存；高亮画在页面上，左侧编号徽标点开可查看、引用、删除。
+- 顶栏「批注 N」打开本 PDF 的批注列表，每条可「引用」进当前会话或删除。
+- 存储位置：**PDF 同级的 `marks/<pdf-name>.marks.json`**，不写工作区根目录。结构：
+
+  ```json
+  {
+    "version": 1,
+    "pdf": "main.pdf",
+    "marks": [{
+      "id": "m-…",
+      "pageIndex": 3,
+      "rect": { "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.04 },
+      "segmentRects": [{ "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.04 }],
+      "strokeColor": "#f59e0b",
+      "custom": { "quote": "原文……" },
+      "createdAt": 1790000000000
+    }]
+  }
+  ```
+
+  `pageIndex` 从 0 开始，`rect` / `segmentRects` 是页内比例（0–1），缩放不影响。相对 PDF 路径按会话 `cwd` 解析，越出工作区的路径会被拒绝。
+
+### 显示设置
+
+顶栏「设置」可调**译文字号**（11–20px）和**气泡宽度**（280–640px），改动立即生效并写入 `localStorage` 的 `dsh-paper-lens:ui`，重启后保留。
+
+### 翻译提速
+
+- 先量基线：1129 字符段落（真实 DSH + 模型）`fetch` 等到响应头 8.6s、首 delta 8.6s、整段 10.2s、57 个分片。
+- 改进：
+  - **提前 flush**：`writeHead` 后立即 `flushHeaders()`，`fetch` 不必等模型首 token。
+  - **同选区缓存**：`provider/model + 原文` 作键，最多 48 条；命中时直接回一条 `{delta}` + `{done}`，响应头带 `x-dpl-cache: hit`。
+  - **动态 maxTokens**：`max(512, len * 1.6)` 且不超过 4096，短句不再要 4096。
+  - **按段并行**：300 字符以上且有空行分段时，最多 3 段并行请求；第一段实时出字，其余按顺序补，不改变阅读顺序。
 
 ### 翻译是怎么实现的
 

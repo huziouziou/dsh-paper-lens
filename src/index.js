@@ -18,6 +18,9 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
+import { addMark, MARK_COLORS, pdfExists, readMarks, removeMark, resolvePdfPath } from './marks.js';
+import { promptsForConfig } from './prompts.js';
+
 export const name = 'dsh-paper-lens';
 export const inject = [];
 
@@ -130,6 +133,48 @@ export const BASE = '/plugin-data/dsh-paper-lens';
 /** 划词翻译一次能送出的最大字符数（服务端与客户端共用同一条上限）。 */
 export const MAX_TRANSLATE_CHARS = 6000;
 
+/** 同选区缓存的上限（条）；只存已成功、非空的译文。 */
+export const TRANSLATE_CACHE_MAX = 48;
+
+/**
+ * 一次翻译的 token 上限。不要把 4096 无条件塞给每个短句：有些适配器会按上限
+ * 预留/调度，短文本反而慢。按中文字符数估一个够用的值，并保留 512 的下限。
+ */
+export function translationMaxTokens(text, cap = 4096) {
+  return Math.min(cap, Math.max(512, Math.ceil(String(text ?? '').length * 1.6)));
+}
+
+/**
+ * 按空行切段，供长选区并行翻译。单段返回 []，调用方走原来的整段路径。
+ * 选区来自 PDF 文本层，很多时候只有单换行；那种情况不硬拆，避免把一句话切碎。
+ */
+export function splitParagraphs(text) {
+  const parts = String(text ?? '').split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  return parts.length > 1 ? parts : [];
+}
+
+/** 把 N 段并成至多 max 组，保持原顺序；组内仍用空行分隔。 */
+export function groupParagraphs(parts, max = 3) {
+  if (parts.length <= max) return [...parts];
+  const groups = Math.min(max, parts.length);
+  const base = Math.floor(parts.length / groups);
+  const extra = parts.length % groups;
+  const out = [];
+  let at = 0;
+  for (let g = 0; g < groups; g += 1) {
+    const size = base + (g < extra ? 1 : 0);
+    out.push(parts.slice(at, at + size).join('\n\n'));
+    at += size;
+  }
+  return out;
+}
+
+/** 同选区缓存的键：模型与原文都算进去，换模型不会拿到旧译文。 */
+export function translateCacheKey(selection, text) {
+  return `${selection?.provider ?? ''}/${selection?.model ?? ''}\n${text}`;
+}
+
+
 /**
  * 翻译的提示词：只要译文。
  *
@@ -169,7 +214,7 @@ export function pickSelection(scope, config = {}) {
  * 界面是流式的（边出边看），所以正常路径下 `out` 只是给调用方核对用的；
  * 只有「模型没给出任何文字」时才用它判断失败。
  */
-export async function translateText(llm, selection, text, { maxChars = MAX_TRANSLATE_CHARS, sessionId, onDelta } = {}) {
+export async function translateText(llm, selection, text, { maxChars = MAX_TRANSLATE_CHARS, sessionId, onDelta, maxTokens } = {}) {
   const clipped = String(text ?? '').slice(0, maxChars);
   let out = '';
   const chunkKinds = {};
@@ -180,7 +225,7 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
     provider: selection.provider,
     model: selection.model,
     messages: [{ role: 'user', content: [{ type: 'text', text: translatePrompt(clipped) }] }],
-    maxTokens: 4096,
+    maxTokens: maxTokens ?? translationMaxTokens(clipped),
     ...(sessionId ? { sessionId } : {}),
   })) {
     const kind = String(chunk?.type ?? chunk?.kind ?? 'unknown');
@@ -243,9 +288,16 @@ export function apply(ctx, config = {}) {
   const agentsBySession = new Map();
   /** session id -> that chat's agent，用来读它实际路由到的 provider/model。 */
   const agentBySession = new Map();
+  /** provider/model + 原文 -> 译文；短时间重复划同一段不再等模型。 */
+  const translateCache = new Map();
   const added = new WeakSet();
 
   const sessionIdOf = (agent) => String(agent?.session?.id ?? '');
+  /** The session's workspace root, as dsh records it in the session header. */
+  const cwdOf = (sessionId) => {
+    const agent = agentBySession.get(sessionId);
+    return agent?.session?.header?.cwd ?? agent?.session?.cwd ?? undefined;
+  };
 
   function setModeSection(agentCtx, on) {
     const prompt = service(agentCtx, 'systemPrompt');
@@ -343,6 +395,79 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  // 客户端读预设提示词、批注颜色；配置从插件 config 来，改完重启即生效。
+  const configRoute = (web) => web.register({
+    kind: 'exact',
+    path: `${BASE}/config`,
+    handler: async (req = {}, res) => {
+      if ((req.method || 'GET').toUpperCase() !== 'GET') return sendJson(res, 405, { error: '只支持 GET' });
+      return sendJson(res, 200, { prompts: promptsForConfig(config), markColors: MARK_COLORS });
+    },
+  });
+
+  // 批注：PDF 同级的 marks/<name>.marks.json。
+  //   GET    ?session=…&path=…            → { marks }
+  //   POST   { session, path, mark }      → { mark }
+  //   DELETE ?session=…&path=…&id=…       → { ok: true }
+  const marksRoute = (web) => web.register({
+    kind: 'exact',
+    path: `${BASE}/marks`,
+    handler: async (req = {}, res) => {
+      const method = (req.method || 'GET').toUpperCase();
+      const url = new URL(req.url ?? '/', 'http://x');
+      let body = null;
+      if (method === 'POST') {
+        body = await readJson(req, 128 * 1024);
+        if (!body) return sendJson(res, 400, { error: '请求体需要 JSON' });
+      }
+      const session = typeof body?.session === 'string' ? body.session : (url.searchParams.get('session') ?? '');
+      const path = typeof body?.path === 'string' ? body.path : (url.searchParams.get('path') ?? '');
+      const pdfPath = resolvePdfPath(path, cwdOf(session));
+      if (!pdfPath) {
+        return sendJson(res, 400, session
+          ? { error: 'PDF 路径缺失或越出会话工作区' }
+          : { error: '缺少 session，无法解析 PDF 的相对路径' });
+      }
+      if (!pdfExists(pdfPath)) return sendJson(res, 404, { error: 'PDF 不在磁盘上（可能已移动或删除）' });
+      if (method === 'GET') return sendJson(res, 200, { marks: readMarks(pdfPath) });
+      if (method === 'POST') {
+        try {
+          const mark = addMark(pdfPath, body?.mark);
+          if (!mark) return sendJson(res, 400, { error: '批注字段不完整：需要 pageIndex、rect、strokeColor、custom.quote' });
+          return sendJson(res, 200, { mark });
+        } catch (error) {
+          return sendJson(res, 500, { error: `批注没保存：${error?.message ?? error}` });
+        }
+      }
+      if (method === 'DELETE') {
+        const id = typeof body?.id === 'string' ? body.id : (url.searchParams.get('id') ?? '');
+        if (!id) return sendJson(res, 400, { error: '缺少 id' });
+        try {
+          if (!removeMark(pdfPath, id)) return sendJson(res, 404, { error: '没有这条批注' });
+          return sendJson(res, 200, { ok: true });
+        } catch (error) {
+          return sendJson(res, 500, { error: `批注没删掉：${error?.message ?? error}` });
+        }
+      }
+      return sendJson(res, 405, { error: '只支持 GET/POST/DELETE' });
+    },
+  });
+
+  if (config.routes !== false) {
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['webServer'], (scope) => {
+        scope.effect(() => configRoute(scope.webServer), 'dsh-paper-lens: config route');
+        scope.effect(() => marksRoute(scope.webServer), 'dsh-paper-lens: marks route');
+      });
+    } else {
+      const web = service(ctx, 'webServer');
+      if (web?.register) {
+        ctx.effect?.(() => configRoute(web), 'dsh-paper-lens: config route');
+        ctx.effect?.(() => marksRoute(web), 'dsh-paper-lens: marks route');
+      }
+    }
+  }
+
   // 划词翻译：POST { text } → NDJSON 流（{delta} / {error} / {done}）。
   // 这里硬依赖 llm 服务；没有它时这条路由不挂载，插件的引用/链接功能照常工作。
   const translateRoute = (scope) => scope.webServer.register({
@@ -377,21 +502,74 @@ export function apply(ctx, config = {}) {
       //   {"error":"…"}  失败（含分片直方图与失败码）
       //   {"done":true}  正常结束
       // 用 JSON 行而不是裸文本，因为译文里本来就有换行，裸文本没法区分"内容"与"结束"。
+      const cacheKey = translateCacheKey(selection, text);
+      const cached = translateCache.get(cacheKey);
       res.writeHead(200, {
         'content-type': 'application/x-ndjson; charset=utf-8',
         'cache-control': 'no-store',
         'x-accel-buffering': 'no',
+        ...(cached ? { 'x-dpl-cache': 'hit' } : {}),
       });
+      // 先把响应头推给客户端：fetch 不必等到模型首 token 才 resolve。
+      res.flushHeaders?.();
+      res.socket?.setNoDelay?.(true);
       const push = (payload) => {
         try { res.write(`${JSON.stringify(payload)}\n`); } catch { /* 客户端已断开 */ }
       };
+      if (cached) {
+        push({ delta: cached });
+        push({ done: true });
+        try { res.end(); } catch { /* 已经结束 */ }
+        return undefined;
+      }
+      const remember = (translation) => {
+        if (!translation) return;
+        translateCache.set(cacheKey, translation);
+        while (translateCache.size > TRANSLATE_CACHE_MAX) translateCache.delete(translateCache.keys().next().value);
+      };
       try {
-        const result = await translateText(llm, selection, text, {
-          sessionId,
-          onDelta: (delta) => push({ delta }),
-        });
-        if (!result.translation) push({ error: translateFailureText(selection, result) });
-        else push({ done: true });
+        // 多段长选区：各段并行请求，第一段仍实时出字，其余段到了按顺序补。
+        const paragraphs = splitParagraphs(text);
+        const groups = paragraphs.length >= 2 && text.length >= 300 ? groupParagraphs(paragraphs, 3) : [];
+        if (groups.length >= 2) {
+          const buffers = groups.map(() => '');
+          const tasks = groups.map((part, i) => translateText(llm, selection, part, {
+            sessionId,
+            maxTokens: translationMaxTokens(part),
+            onDelta: i === 0 ? (delta) => push({ delta }) : (delta) => { buffers[i] += delta; },
+          }));
+          const first = await tasks[0];
+          if (!first.translation) {
+            push({ error: translateFailureText(selection, first) });
+          } else {
+            let combined = first.translation;
+            for (let i = 1; i < groups.length; i += 1) {
+              const result = await tasks[i];
+              if (!result.translation) {
+                push({ error: translateFailureText(selection, result) });
+                combined = '';
+                break;
+              }
+              push({ delta: `\n\n${result.translation}` });
+              combined += `\n\n${result.translation}`;
+            }
+            if (combined) {
+              remember(combined);
+              push({ done: true });
+            }
+          }
+        } else {
+          const result = await translateText(llm, selection, text, {
+            sessionId,
+            maxTokens: translationMaxTokens(text),
+            onDelta: (delta) => push({ delta }),
+          });
+          if (!result.translation) push({ error: translateFailureText(selection, result) });
+          else {
+            remember(result.translation);
+            push({ done: true });
+          }
+        }
       } catch (error) {
         push({ error: `翻译失败：${error?.message ?? error}` });
       } finally {

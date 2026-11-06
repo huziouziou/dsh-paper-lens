@@ -41,9 +41,10 @@ function request(handler, body, method = 'POST') {
     url: TRANSLATE,
     async* [Symbol.asyncIterator]() { for (const c of chunks) yield c; },
   };
-  const out = { status: null, headers: null, chunks: [], ended: false };
+  const out = { status: null, headers: null, chunks: [], ended: false, flushed: false };
   const res = {
     writeHead(status, headers) { out.status = status; out.headers = headers; },
+    flushHeaders() { out.flushed = true; },
     write(text) { out.chunks.push(text); return true; },
     end() { out.ended = true; },
   };
@@ -211,6 +212,66 @@ test('each delta reaches the response while the model is still generating', asyn
     await running;
     assert.deepEqual(lines(out), [{ delta: '第一段' }, { delta: '第二段' }, { done: true }]);
     assert.equal(out.ended, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('headers are flushed before the model produces anything', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dpl-route-'));
+  try {
+    const handler = harness(llmYielding([{ type: 'text-delta', index: 0, text: '好' }, { type: 'finish', reason: 'stop' }]), join(dir, 'state.json'));
+    const out = await request(handler, { text: 'Hello.' });
+    assert.equal(out.flushed, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the same passage is served from cache without calling the model again', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dpl-route-'));
+  try {
+    let calls = 0;
+    const handler = harness({
+      stream() {
+        calls += 1;
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: '缓存译文' };
+          yield { type: 'finish', reason: 'stop' };
+        })();
+      },
+    }, join(dir, 'state.json'));
+
+    const first = await request(handler, { text: 'Hello.' });
+    assert.equal(calls, 1);
+    assert.equal(first.headers['x-dpl-cache'], undefined);
+
+    const second = await request(handler, { text: 'Hello.' });
+    assert.equal(calls, 1, '第二次不应该再请求模型');
+    assert.equal(second.headers['x-dpl-cache'], 'hit');
+    assert.deepEqual(lines(second), [{ delta: '缓存译文' }, { done: true }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('paragraphs are translated in parallel and emitted in reading order', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dpl-route-'));
+  try {
+    const handler = harness({
+      stream(options) {
+        const prompt = options.messages[0].content[0].text;
+        const which = prompt.includes('AAAA') ? '甲' : '乙';
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: which };
+          yield { type: 'finish', reason: 'stop' };
+        })();
+      },
+    }, join(dir, 'state.json'));
+
+    const text = `${'A'.repeat(200)}\n\n${'B'.repeat(200)}`;
+    const out = await request(handler, { text });
+    assert.deepEqual(lines(out), [{ delta: '甲' }, { delta: '\n\n乙' }, { done: true }]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

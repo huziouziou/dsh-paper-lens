@@ -12,17 +12,21 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 /* ---- quoting -------------------------------------------------------------- */
 
-test('cleanSelection rejoins hyphenated line breaks and collapses whitespace', () => {
+test('cleanSelection keeps paragraph breaks and rejoins hyphenated line breaks', () => {
   assert.equal(cleanSelection('per-target eval-\nuation   records\nwill  be'), 'per-target evaluation records will be');
   assert.equal(cleanSelection('soft­hyphen'), 'softhyphen');
+  assert.equal(cleanSelection('first paragraph\n\nsecond   paragraph'), 'first paragraph\n\nsecond paragraph');
 });
 
 test('formatQuote tags the passage with file and page, and asks for [p.N] citations', () => {
-  const quote = formatQuote({ file: 'main.pdf', page: 17, text: 'Code will be released.', action: 'quote' });
+  const quote = formatQuote({ file: 'main.pdf', page: 17, text: 'Code will be released.' });
   assert.match(quote, /^> \*\*main\.pdf · p\.17:\*\* "Code will be released\."/);
   assert.ok(quote.includes(CITE_HINT));
-  assert.match(formatQuote({ file: 'a.pdf', page: 2, text: 'x', action: 'ask' }), /问题：$/);
-  assert.match(formatQuote({ file: 'a.pdf', page: 2, text: 'x', action: 'check' }), /^> .*\n\n检查这段：.*Cite places in the PDF as \[file\.pdf p\.N "exact words"\]\.$/s);
+  assert.doesNotMatch(quote, /问题：/);
+  const asked = formatQuote({ file: 'a.pdf', page: 2, text: 'x', prompt: '问题：' });
+  assert.match(asked, /\(Cite places in the PDF as \[file\.pdf p\.N "exact words"\]\.\)\n\n问题：\n$/);
+  const checked = formatQuote({ file: 'a.pdf', page: 2, text: 'x', prompt: '检查这段。' });
+  assert.match(checked, /检查这段。\n$/);
 });
 
 test('appendToDraft keeps what is already typed', () => {
@@ -162,8 +166,14 @@ test('the PDF bar uses the host document-preview surface, not token names dsh ne
   assert.doesNotMatch(code, /--dsw-alias-bg-secondary\b/);
 });
 
-test('a named citation finds its chat on both dsh lines, and says so when there is none', () => {
+test('a PDF address carries the session that owns its workspace', () => {
   const client = loadClient();
+  assert.equal(client.exports.sessionOfAddress('dsh-resource://file/session/s1/paper/main.pdf'), 's1');
+  assert.equal(client.exports.sessionOfAddress('dsh-resource://file/session/s%201/paper/main.pdf'), 's 1');
+  assert.equal(client.exports.sessionOfAddress('dsh-resource://file/absolute/C%3A/papers/main.pdf'), undefined);
+});
+
+test('a named citation finds its chat on both dsh lines, and says so when there is none', () => {  const client = loadClient();
   const opened = [];
   const withChat = (snapshot, mounted) => ({
     sessions: { list: { getSnapshot: () => snapshot } },

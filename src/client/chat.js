@@ -8,53 +8,35 @@
 // whose state carries the live draft and whose setDraft() replaces it. A quote
 // is appended under whatever is already typed, never over it.
 
-/** What each toolbar button asks, after the quoted passage. */
-export const ACTIONS = {
-  quote: { label: '引用', title: '把这段引用到当前会话，在下面写你的问题', prompt: '' },
-  ask: { label: '提问', title: '就这段提问——光标停在「问题：」后面', prompt: '问题：' },
-  explain: {
-    label: '解释',
-    title: '解释这段在讲什么',
-    prompt: '解释这段：它说了什么，为什么在这篇论文里重要。',
-  },
-  check: {
-    label: '挑错',
-    title: '检查这段有无错误与无依据的说法',
-    prompt: '检查这段：每个说法是否有论文依据、是否与论文其他地方一致、表述是否清楚？列出具体问题和改法。',
-  },
-};
-
 /** How the model is asked to cite pages, so the citations become links. */
 export const CITE_HINT = 'Cite places in the PDF as [file.pdf p.N "exact words"].';
 
-/** Collapse a PDF text-layer selection into clean prose. */
+/** Collapse a PDF text-layer selection into clean prose; keep paragraph breaks. */
 export function cleanSelection(text) {
   return String(text ?? '')
     .replace(/­/g, '') // soft hyphens
+    .replace(/\r\n?/g, '\n')
     .replace(/(\w)-\s*\n\s*(\w)/g, '$1$2') // words hyphenated across a line break
-    .replace(/[ \t]*\n[ \t]*/g, ' ')
+    .replace(/[ \t]*\n[ \t]*\n[ \t]*/g, '\u0000') // protect blank-line paragraphs
+    .replace(/[ \t]*\n[ \t]*/g, ' ') // single line breaks are just layout
+    .replace(/\u0000/g, '\n\n')
     .replace(/[ \t ]{2,}/g, ' ')
     .trim();
 }
 
-/** The block a button puts into the composer. */
-export function formatQuote({ file, page, text, action = 'quote' }) {
+/**
+ * The block a selection puts into the composer.
+ *
+ * `prompt` is optional: empty means a plain quote. A preset prompt comes from
+ * the caret/long-press menu, whose entries are configurable in the plugin.
+ */
+export function formatQuote({ file, page, text, prompt = '' }) {
   const passage = cleanSelection(text);
   const where = page ? `${file} · p.${page}` : file;
   const quote = `> **${where}:** "${passage}"`;
-  if (action === 'quote') return `${quote}
-
-(${CITE_HINT})
-
-`;
-  if (action === 'ask') return `${quote}
-
-(${CITE_HINT})
-
-${ACTIONS.ask.prompt}`;
-  return `${quote}
-
-${ACTIONS[action]?.prompt ?? ''} ${CITE_HINT}`.trimEnd();
+  const trail = String(prompt ?? '').trim();
+  if (!trail) return `${quote}\n\n(${CITE_HINT})\n\n`;
+  return `${quote}\n\n(${CITE_HINT})\n\n${trail}\n`;
 }
 
 /** Append a block to an existing draft, leaving one blank line between them. */
