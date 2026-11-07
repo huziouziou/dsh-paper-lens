@@ -16,6 +16,7 @@ import { CiteLinksHeaderButton, CHIP_CSS, lastSessionId } from './chip.js';
 import { DEFAULT_PROMPTS } from '../prompts.js';
 import { DEFAULT_PREFS, FONT_RANGE, THEMES, WIDTH_RANGE, loadPrefs, savePrefs } from './prefs.js';
 import { MARK_COLORS, deleteMark, loadMarks, markFromSelection, saveMark, updateMarkNote } from './marks.js';
+import { copyText } from './clipboard.js';
 
 const h = React.createElement;
 const { useEffect, useRef, useState, useCallback } = React;
@@ -141,6 +142,7 @@ const CSS = [
   '.dpa-settings-row output{width:52px;text-align:right;font-variant-numeric:tabular-nums}',
   '.dpa-mark-detail{position:fixed;z-index:1004;width:300px;max-width:calc(100vw - 24px);padding:9px 11px;border-radius:9px;background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#1f2937);border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.14));box-shadow:0 10px 30px rgba(0,0,0,.3);font:12px/1.55 system-ui,sans-serif}',
   '.dpa-mark-detail .dpa-mark-quote{-webkit-line-clamp:5;margin:4px 0 8px}',
+  '.dpa-mark-detail .dpa-detail-head{cursor:move;user-select:none;touch-action:none}',
   '.dpa-mark-detail .dpa-mark-actions{margin-top:0}',
   '.dpa-mark-detail .dpa-mark-actions button{padding:2px 8px;font-size:11px}',
   // 译文气泡跟随应用主题（明/暗），而不是写死的深色底——写死深色在浅色主题下对比很糟。
@@ -150,6 +152,7 @@ const CSS = [
   '.dpa-tr-title{flex:1}',
   '.dpa-tr-head button{border:none;background:transparent;color:inherit;cursor:pointer;font:inherit;line-height:1;padding:2px 6px;border-radius:5px}',
   '.dpa-tr-head button:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.16))}',
+  '.dpa-tr-head button:disabled{opacity:.38;cursor:default} ',
   '.dpa-tr-body{padding:10px 12px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:var(--dsw-alias-label-primary,#1f2937)}',
   '.dpa-tr-body.dpa-err{color:var(--dsw-alias-state-error-primary,#dc2626)}',
   '.dpa-tr-body.dpa-tr-loading{opacity:.9}',
@@ -309,6 +312,8 @@ function PdfAskBody(props) {
   const [marks, setMarks] = useState([]);
   const [marksOpen, setMarksOpen] = useState(false);
   const [markDetail, setMarkDetail] = useState(null);
+  /** 批注详情卡被拖动后的位移（相对它打开时的位置），null = 没动过。 */
+  const [markDrag, setMarkDrag] = useState(null);
   /** 详情卡里正在编辑的文字批注；保存前只活在组件里。 */
   const [noteDraft, setNoteDraft] = useState('');
   /** 字号与气泡宽度，localStorage 持久化。 */
@@ -589,20 +594,35 @@ function PdfAskBody(props) {
     }
   };
 
-  /** 按住标题栏拖动译文气泡；位置是相对选区位置的位移。 */
-  const startTrDrag = (event) => {
+  /** 通用拖动：按住某处拖动浮层，位移相对它打开时的位置。 */
+  const startFloatDrag = (event, base, setOffset) => {
     if (event.button !== 0) return;
     event.preventDefault();
     const startX = event.clientX;
     const startY = event.clientY;
-    const base = trDrag ?? { dx: 0, dy: 0 };
-    const move = (e) => setTrDrag({ dx: base.dx + (e.clientX - startX), dy: base.dy + (e.clientY - startY) });
+    const move = (e) => setOffset({ dx: base.dx + (e.clientX - startX), dy: base.dy + (e.clientY - startY) });
     const up = () => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
+  };
+
+  /** 按住标题栏拖动译文气泡；位置是相对选区位置的位移。 */
+  const startTrDrag = (event) => startFloatDrag(event, trDrag ?? { dx: 0, dy: 0 }, setTrDrag);
+
+  /** 按住批注卡的标题栏拖动它；卡片里点按钮不算拖动。 */
+  const startMarkDrag = (event) => {
+    if (event.target?.closest?.('button, textarea')) return;
+    startFloatDrag(event, markDrag ?? { dx: 0, dy: 0 }, setMarkDrag);
+  };
+
+  /** 把一段文字放进剪贴板，并在状态条上说一声。 */
+  const copyToClipboard = async (text, label) => {
+    const ok = await copyText(text);
+    say(ok ? `已复制${label}` : '复制失败，请手动选中后按 Ctrl+C', !ok);
+    return ok;
   };
 
   // 流式输出时跟着滚到底，否则新到的译文会藏在可视区下面。
@@ -625,6 +645,7 @@ function PdfAskBody(props) {
 
   const openMark = (mark, event) => {
     setNoteDraft(mark?.custom?.note ?? '');
+    setMarkDrag(null);
     setMarkDetail({ mark, x: event?.clientX ?? 160, y: event?.clientY ?? 120 });
   };
 
@@ -674,6 +695,8 @@ function PdfAskBody(props) {
       const saved = await saveMark({ session, path: pathOfAddress(address), mark });
       drawMarks([...marks, saved]);
       setNoteDraft('');
+      setNoteDraft('');
+      setMarkDrag(null);
       setMarkDetail({ mark: saved, ...anchor });
       say(`已保存第 ${pop.page} 页批注，可继续写文字`);
       clearSelection();
@@ -793,10 +816,14 @@ function PdfAskBody(props) {
     : null;
 
   const markDetailStyle = markDetail
-    ? {
-        left: `${Math.max(8, Math.min(window.innerWidth - 308, (markDetail.x ?? 120) + 12))}px`,
-        top: `${Math.max(8, Math.min(window.innerHeight - 230, (markDetail.y ?? 120) + 12))}px`,
-      }
+    ? (() => {
+        const width = 300;
+        const baseLeft = Math.max(8, Math.min(window.innerWidth - width - 8, (markDetail.x ?? 120) + 12));
+        const baseTop = Math.max(8, Math.min(window.innerHeight - 230, (markDetail.y ?? 120) + 12));
+        const left = Math.max(4, Math.min(window.innerWidth - width - 4, baseLeft + (markDrag?.dx ?? 0)));
+        const top = Math.max(4, Math.min(window.innerHeight - 64, baseTop + (markDrag?.dy ?? 0)));
+        return { left: `${left}px`, top: `${top}px` };
+      })()
     : null;
 
   return h(
@@ -889,6 +916,13 @@ function PdfAskBody(props) {
             onMouseDown: (event) => event.preventDefault(),
             onClick: () => { setPromptMenu(false); setPalette((v) => !v); },
           }, '标注'),
+          h('button', {
+            type: 'button',
+            className: 'dpa-copy',
+            title: '复制这段文字（只复制正文，不带换行噪声）',
+            onMouseDown: (event) => event.preventDefault(), // keep the selection
+            onClick: () => copyToClipboard(cleanSelection(pop.text), '选中文字'),
+          }, '复制'),
           promptMenu
             ? h(
                 'div',
@@ -936,6 +970,14 @@ function PdfAskBody(props) {
               { className: 'dpa-tr-title' },
               tr.phase === 'streaming' ? '正在翻译…' : tr.phase === 'error' ? '翻译失败' : '译文',
             ),
+            h('button', {
+              type: 'button',
+              className: 'dpa-tr-copy',
+              title: '复制译文',
+              disabled: tr.phase !== 'done' || !String(tr.text ?? '').trim(),
+              onPointerDown: (event) => event.stopPropagation(), // 别让点复制变成拖动
+              onClick: () => copyToClipboard(tr.text, '译文'),
+            }, '复制'),
             h('button', {
               type: 'button',
               title: '关闭',
@@ -1063,7 +1105,8 @@ function PdfAskBody(props) {
           { className: 'dpa-mark-detail', style: markDetailStyle, role: 'dialog', 'aria-label': '批注内容' },
           h(
             'div',
-            { className: 'dpa-panel-head' },
+            { className: 'dpa-panel-head dpa-detail-head', onPointerDown: startMarkDrag, title: '按住这里可以拖动这张卡片' },
+            h('span', { className: 'dpa-tr-grip', 'aria-hidden': 'true' }, '⋮⋮'),
             h('span', null, `p.${markDetail.mark.pageIndex + 1} 批注`),
             h('span', { className: 'dpa-spacer' }),
             h('button', { type: 'button', title: '关闭', onClick: () => setMarkDetail(null) }, '×'),
