@@ -81,8 +81,13 @@ export class PdfView {
     this.settleTimer = null;
     this.marks = [];
     this.onMarkClick = null;
+    this.pendingPage = 0;
 
     this.resizeObserver = new ResizeObserver(() => {
+      // A tab that was hidden while the PDF opened has no height yet: the saved
+      // page can only be applied once it is laid out (scrollTop on a hidden
+      // element stays 0).
+      if (this.pendingPage) this.applyPendingPage();
       if (this.zoom === 'fit') this.relayout();
     });
     this.resizeObserver.observe(container);
@@ -151,8 +156,36 @@ export class PdfView {
     }
     this.container.appendChild(frag);
     this.applySizes();
-    this.trackPage(true);
+    // Not trackPage(true): a forced track reports page 1 as if the reader had
+    // moved there, and the body saves that over the real last page. The bar
+    // starts at 1 anyway; restoring a saved page sets currentPage explicitly.
+    this.trackPage();
     this.schedule();
+  }
+
+  /**
+   * Put the reader back on a saved page, once the scroller has a real height.
+   * Setting scrollTop on a hidden tab does nothing, so keep the number pending
+   * and let the ResizeObserver retry when the tab is shown.
+   */
+  restorePage(n) {
+    const page = Math.max(1, Math.min(Math.floor(Number(n) || 1), this.pages.length || 1));
+    if (page <= 1) return false;
+    this.pendingPage = page;
+    return this.applyPendingPage();
+  }
+
+  applyPendingPage() {
+    const page = this.pendingPage;
+    if (!page || this.disposed || !this.pages.length) return false;
+    if (this.scroller.clientHeight === 0) return false;
+    this.pendingPage = 0;
+    this.scrollToPage(page, 0, false);
+    // Set currentPage too: loadSizes() calls applySizes(true), which keeps the
+    // place of `currentPage` — left at 1 it would scroll the reader back.
+    this.trackPage();
+    this.schedule();
+    return true;
   }
 
   async loadSizes() {
@@ -546,6 +579,13 @@ export class PdfView {
 /**
  * Where a DOM selection sits in a PDF: its page and, for a later flash, its
  * boxes as fractions of that page. Null when the selection is not on a page.
+ *
+ * Cross-page selections are the reason this is more than `selection.toString()`:
+ * the browser's string runs from the caret on page A to the caret on page B, so it
+ * picks up whatever sits between them — running heads, the bioRxiv licence strip,
+ * footers. We rebuild the text page by page and drop the small type in the top
+ * band of a page the selection only passes into (and the bottom band it passes
+ * out of). A single-page selection keeps every line, exactly as before.
  */
 export function selectionInPdf(selection, root) {
   if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
@@ -553,7 +593,9 @@ export function selectionInPdf(selection, root) {
   const node = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
   const pageEl = node?.closest?.('.dpa-page');
   if (!pageEl || !root.contains(pageEl)) return null;
-  const text = selection.toString();
+  const pieces = selectionPieces(range, root);
+  if (!pieces.length) return null;
+  const text = selectionText(groupPieces(pieces));
   if (text.trim() === '') return null;
   const pageRect = pageEl.getBoundingClientRect();
   const boxes = [...range.getClientRects()]
@@ -566,5 +608,131 @@ export function selectionInPdf(selection, root) {
     }))
     .filter((b) => b.x > -0.05 && b.x < 1.05 && b.y > -0.05 && b.y < 1.05 && b.w < 1.1);
   const rect = range.getBoundingClientRect();
-  return { page: Number(pageEl.dataset.page), text, boxes, rect };
+  // A cross-page selection's union rect can sit mostly below the viewport (its
+  // bottom is off-screen), so the toolbar anchored to it lands off-screen too.
+  // Anchor on the last line that is actually visible: that is the end of the
+  // selection the reader is looking at, or the bottom edge of a long one.
+  const rects = [...range.getClientRects()].filter((r) => r.width > 1 && r.height > 1);
+  const height = typeof window === 'undefined' ? 0 : window.innerHeight;
+  const visible = rects.filter((r) => r.bottom > 4 && r.top < height - 4 && r.right > 0 && r.left < window.innerWidth);
+  const anchor = visible.length ? visible[visible.length - 1] : null;
+  const pages = [...new Set(pieces.map((piece) => Number(piece.pageEl.dataset.page)))];
+  return { page: Number(pageEl.dataset.page), pages, text, boxes, rect, anchor };
+}
+
+/**
+ * The selected words per page, clipped to the selection, with the geometry we
+ * need to tell body text from a running head. Only pages the selection touches
+ * are walked, so a long document costs nothing.
+ */
+function selectionPieces(range, root) {
+  const pieces = [];
+  for (const pageEl of root.querySelectorAll('.dpa-page')) {
+    if (!range.intersectsNode(pageEl)) continue;
+    const walker = document.createTreeWalker(pageEl, NodeFilter.SHOW_TEXT, {
+      acceptNode(text) {
+        if (!text.nodeValue || text.nodeValue.trim() === '') return NodeFilter.FILTER_REJECT;
+        if (text.parentElement?.closest('.dpa-anno, .dpa-anno-badge, .dpa-pageno')) return NodeFilter.FILTER_REJECT;
+        return range.intersectsNode(text) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      },
+    });
+    for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+      const start = text === range.startContainer ? range.startOffset : 0;
+      const end = text === range.endContainer ? range.endOffset : text.nodeValue.length;
+      if (end <= start) continue;
+      const value = text.nodeValue.slice(start, end);
+      if (value.trim() === '') continue;
+      const clipped = document.createRange();
+      clipped.setStart(text, start);
+      clipped.setEnd(text, end);
+      const rects = [...clipped.getClientRects()].filter((r) => r.width > 0.5 && r.height > 0.5);
+      if (!rects.length) continue;
+      const style = text.parentElement ? getComputedStyle(text.parentElement) : null;
+      pieces.push({
+        pageEl,
+        text: value,
+        rects,
+        rect: rects[0],
+        fontSize: parseFloat(style?.fontSize ?? '') || 0,
+      });
+    }
+  }
+  return pieces;
+}
+
+/** Pieces in reading order, grouped by the page they sit on. */
+function groupPieces(pieces) {
+  const groups = [];
+  const byPage = new Map();
+  for (const piece of pieces) {
+    let group = byPage.get(piece.pageEl);
+    if (!group) {
+      group = { pageEl: piece.pageEl, pieces: [] };
+      byPage.set(piece.pageEl, group);
+      groups.push(group);
+    }
+    group.pieces.push(piece);
+  }
+  return groups;
+}
+
+/** The page's body size, used to recognise smaller running heads/footers. */
+function medianFontSize(pieces) {
+  const sizes = pieces.map((piece) => piece.fontSize).filter((size) => size > 0).sort((a, b) => a - b);
+  return sizes.length ? sizes[Math.floor(sizes.length / 2)] : 0;
+}
+
+/**
+ * The body size of a whole page, not just the selected pieces: a licence strip
+ * can outnumber the body lines inside the selection and drag the median down,
+ * which would make every line look like body text. Cached per page element; the
+ * ratio between sizes is what matters, so a zoom keeps the cached value usable.
+ */
+const pageBodySizes = new WeakMap();
+function pageBodySize(pageEl) {
+  if (pageBodySizes.has(pageEl)) return pageBodySizes.get(pageEl);
+  const sizes = [];
+  const walker = document.createTreeWalker(pageEl, NodeFilter.SHOW_TEXT, {
+    acceptNode(text) {
+      if (!text.nodeValue || text.nodeValue.trim() === '') return NodeFilter.FILTER_REJECT;
+      if (text.parentElement?.closest('.dpa-anno, .dpa-anno-badge, .dpa-pageno')) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  for (let text = walker.nextNode(); text; text = walker.nextNode()) {
+    const size = parseFloat(text.parentElement ? getComputedStyle(text.parentElement).fontSize : '') || 0;
+    if (size > 0) sizes.push(size);
+  }
+  sizes.sort((a, b) => a - b);
+  const body = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 0;
+  pageBodySizes.set(pageEl, body);
+  return body;
+}
+
+function selectionText(groups) {
+  const lines = [];
+  groups.forEach((group, index) => {
+    const firstPage = index === 0;
+    const lastPage = index === groups.length - 1;
+    const pageRect = group.pageEl.getBoundingClientRect();
+    const body = pageBodySize(group.pageEl) || medianFontSize(group.pieces);
+    for (const piece of group.pieces) {
+      const small = body > 0 && piece.fontSize > 0 && piece.fontSize < body * 0.95;
+      const fromTop = piece.rect.top - pageRect.top;
+      const fromBottom = pageRect.bottom - piece.rect.bottom;
+      // Small type right at the top of a page we are passing into, or right at the
+      // bottom of a page we are passing out of, is furniture, not the passage.
+      if (small && !firstPage && fromTop < pageRect.height * 0.16) continue;
+      if (small && !lastPage && fromBottom < pageRect.height * 0.1) continue;
+      const line = lines[lines.length - 1];
+      if (line && line.pageEl === group.pageEl && Math.abs(piece.rect.top - line.top) < Math.max(2, line.height * 0.6)) {
+        line.text += piece.text;
+        line.top = Math.min(line.top, piece.rect.top);
+        line.height = Math.max(line.height, piece.rect.height);
+      } else {
+        lines.push({ pageEl: group.pageEl, top: piece.rect.top, height: piece.rect.height, text: piece.text });
+      }
+    }
+  });
+  return lines.map((line) => line.text.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
 }

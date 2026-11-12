@@ -19,6 +19,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { addMark, MARK_COLORS, pdfExists, readMarks, removeMark, resolvePdfPath, updateMarkNote } from './marks.js';
+import { translateViaApi } from './api.js';
 import { promptsForConfig } from './prompts.js';
 
 export const name = 'dsh-paper-lens';
@@ -90,30 +91,67 @@ function service(ctx, id) {
   }
 }
 
-/** Which chats have citation links on, kept in a small JSON file. */
+/** The three ways a translation can find a model. */
+export const TRANSLATE_ENGINES = ['session', 'model', 'api'];
+
+/** The stored shape; anything malformed falls back to following the chat. */
+export function normalizeTranslateSettings(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const text = (value) => (typeof value === 'string' ? value.trim() : '');
+  return {
+    engine: TRANSLATE_ENGINES.includes(src.engine) ? src.engine : 'session',
+    provider: text(src.provider),
+    model: text(src.model),
+    baseURL: text(src.baseURL),
+    apiKey: typeof src.apiKey === 'string' ? src.apiKey : '',
+  };
+}
+
+/** What the client may see: the key never leaves the host after it is saved. */
+export function publicTranslateSettings(settings) {
+  const safe = normalizeTranslateSettings(settings);
+  return {
+    engine: safe.engine,
+    provider: safe.provider,
+    model: safe.model,
+    baseURL: safe.baseURL,
+    hasKey: Boolean(safe.apiKey),
+  };
+}
+
+/** Which chats have citation links on, and the optional translation engine. */
 export function createModeStore(file = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'storages', 'dsh-paper-lens.json')) {
-  let state = { citeLinks: {} };
+  let state = { citeLinks: {}, translate: normalizeTranslateSettings() };
   // The plugin was called dsh-pdf-ask before 0.2.0: its file (next to this
   // one) is read when this one does not exist yet, so chats keep their setting.
   for (const candidate of [file, join(dirname(file), 'dsh-pdf-ask.json')]) {
     try {
       const parsed = JSON.parse(readFileSync(candidate, 'utf8'));
       if (parsed && typeof parsed.citeLinks === 'object') {
-        state = parsed;
+        state = { ...parsed, translate: normalizeTranslateSettings(parsed.translate) };
         break;
       }
     } catch { /* not there: try the next, or start fresh */ }
   }
+  const persist = () => {
+    try {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, JSON.stringify(state, null, 2));
+    } catch { /* the change still holds for this run */ }
+  };
   return {
     file,
     isOn: (sessionId) => state.citeLinks[sessionId] === true,
     set(sessionId, on) {
       if (on) state.citeLinks[sessionId] = true;
       else delete state.citeLinks[sessionId];
-      try {
-        mkdirSync(dirname(file), { recursive: true });
-        writeFileSync(file, JSON.stringify(state, null, 2));
-      } catch { /* the toggle still holds for this run */ }
+      persist();
+    },
+    translate: () => ({ ...state.translate }),
+    saveTranslate(patch) {
+      state.translate = normalizeTranslateSettings({ ...state.translate, ...(patch ?? {}) });
+      persist();
+      return { ...state.translate };
     },
   };
 }
@@ -266,11 +304,21 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
   // 用 finish(reason: 'error') 收尾（实测 opencode-go 对 'off' 是后者）。两种都在
   // 「还没出过任何文字」时退回不带 effort 的调用，并把预算抬到 2048，免得再死在
   // max-tokens 上。配置写 `translateReasoning: false` 则直接走退路，不试探。
+  //
+  // 推理模型（flash 只有 low/high/max，没有 off）在 low 下仍可能把 2048 全花在
+  // 思考上：返回 max-tokens 且一个字都没出。这时把预算翻倍再试一次；已经出过字
+  // 的不重试，否则同一段译文会被推两遍。
   const reset = () => {
     out = '';
     finishReason = '';
     failure = null;
     for (const key of Object.keys(chunkKinds)) delete chunkKinds[key];
+  };
+  const budget = maxTokens ?? translationMaxTokens(clipped);
+  const runClean = async (extra) => {
+    reset();
+    await run(extra);
+    return { emitted, finishReason };
   };
   const effort = reasoningEffort === false ? '' : String(reasoningEffort ?? 'off').trim();
   let firstFailed = false;
@@ -285,7 +333,10 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
     if (firstFailed) reset();
   }
   if (firstFailed || !effort) {
-    await run({ maxTokens: Math.max(maxTokens ?? translationMaxTokens(clipped), 2048) });
+    await runClean({ maxTokens: Math.max(budget, 2048) });
+  }
+  if (!emitted && !failure && /max[-_]?tokens|length/i.test(finishReason)) {
+    await runClean({ maxTokens: Math.min(8192, Math.max(budget, 2048) * 2) });
   }
 
 
@@ -308,7 +359,7 @@ export function isUnsupportedReasoningEffort(error) {
 
 /** 把失败原因拼成一行能查的说明：分片直方图 + 失败码 + 结束原因。 */
 function translateFailureText(selection, result) {
-  const kinds = Object.entries(result.chunkKinds).map(([k, n]) => `${k}×${n}`).join('、') || '无分片';
+  const kinds = Object.entries(result.chunkKinds ?? {}).map(([k, n]) => `${k}×${n}`).join('、') || '无分片';
   const code = result.failure?.code ?? '';
   const message = result.failure?.message ?? '';
   const status = result.failure?.status != null ? `HTTP ${result.failure.status}` : '';
@@ -317,9 +368,9 @@ function translateFailureText(selection, result) {
   return `模型没有返回译文（模型 ${selection.provider}/${selection.model}；收到 ${kinds}；${why}）`;
 }
 
-/** 半截译文：不要当成完整结果，也别写进缓存。 */
+/** 半截译文：显示已经译出的部分，但明确标出「被截断」，也别写进缓存。 */
 function translateTruncatedText(result) {
-  return `译文被截断（结束原因 ${result.finishReason || 'max-tokens'}）：模型在预算用尽前只译出一部分。再点一次「译」重试，或缩小选区。`;
+  return `译文被截断（结束原因 ${result.finishReason || 'max-tokens'}）：模型在预算用尽前只译出一部分，上面的文字可能不完整。再点一次「译」重试，或缩小选区。`;
 }
 
 function sendJson(res, status, payload) {
@@ -490,13 +541,50 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  // 客户端读预设提示词、批注颜色；配置从插件 config 来，改完重启即生效。
+  // 客户端读预设提示词、批注颜色与翻译引擎设置。
+  //   GET  → { prompts, markColors, translate }（translate 里不含 apiKey）
+  //   POST { engine?, provider?, model?, baseURL?, apiKey? } → { translate }
+  // apiKey 省略=保持不变；空串=清除。
   const configRoute = (web) => web.register({
     kind: 'exact',
     path: `${BASE}/config`,
     handler: async (req = {}, res) => {
-      if ((req.method || 'GET').toUpperCase() !== 'GET') return sendJson(res, 405, { error: '只支持 GET' });
-      return sendJson(res, 200, { prompts: promptsForConfig(config), markColors: MARK_COLORS });
+      const method = (req.method || 'GET').toUpperCase();
+      if (method === 'GET') {
+        return sendJson(res, 200, {
+          prompts: promptsForConfig(config),
+          markColors: MARK_COLORS,
+          translate: publicTranslateSettings(modes.translate()),
+        });
+      }
+      if (method !== 'POST') return sendJson(res, 405, { error: '只支持 GET/POST' });
+      const body = await readJson(req, 16 * 1024);
+      if (!body || typeof body !== 'object') return sendJson(res, 400, { error: '请求体需要 JSON' });
+      const patch = {};
+      if ('engine' in body) {
+        if (!TRANSLATE_ENGINES.includes(body.engine)) return sendJson(res, 400, { error: 'engine 只能是 session/model/api' });
+        patch.engine = body.engine;
+      }
+      for (const key of ['provider', 'model', 'baseURL']) {
+        if (key in body) {
+          if (typeof body[key] !== 'string') return sendJson(res, 400, { error: `${key} 必须是字符串` });
+          patch[key] = body[key];
+        }
+      }
+      if ('apiKey' in body) {
+        if (typeof body.apiKey !== 'string') return sendJson(res, 400, { error: 'apiKey 必须是字符串' });
+        patch.apiKey = body.apiKey;
+      }
+      const merged = normalizeTranslateSettings({ ...modes.translate(), ...patch });
+      if (merged.engine === 'model' && (!merged.provider || !merged.model)) {
+        return sendJson(res, 400, { error: '指定模型需要同时填 provider 和 model' });
+      }
+      if (merged.engine === 'api') {
+        if (!/^https?:\/\//i.test(merged.baseURL)) return sendJson(res, 400, { error: '自定义 API 的地址要以 http:// 或 https:// 开头' });
+        if (!merged.model) return sendJson(res, 400, { error: '自定义 API 需要模型名' });
+      }
+      const saved = modes.saveTranslate(merged);
+      return sendJson(res, 200, { translate: publicTranslateSettings(saved) });
     },
   });
 
@@ -592,25 +680,34 @@ export function apply(ctx, config = {}) {
       if (text.length > MAX_TRANSLATE_CHARS) {
         return sendJson(res, 413, { error: `文本过长，上限 ${MAX_TRANSLATE_CHARS} 字符` });
       }
+      const settings = modes.translate();
+      // 「自定义 API」是显式选择：不走宿主 llm，也不需要会话凭据。
+      const usingApi = settings.engine === 'api' && Boolean(settings.baseURL && settings.model);
       const llm = scope.llm;
-      if (typeof llm?.stream !== 'function') return sendJson(res, 503, { error: '模型服务不可用' });
-      // 先问「这个会话实际路由到哪个模型」——和官方压缩调用同源（agent.session.requestHeader().config），
-      // 它一定带着可用的凭据；应用默认值只作兜底。
+      if (!usingApi && typeof llm?.stream !== 'function') return sendJson(res, 503, { error: '模型服务不可用' });
       let selection = null;
-      try {
-        const routed = agentBySession.get(sessionId)?.session?.requestHeader?.()?.config;
-        if (routed?.provider && routed?.model) selection = { provider: routed.provider, model: routed.model };
-      } catch { /* 没有该会话时退回默认值 */ }
-      selection ??= pickSelection(scope, config);
-      if (!selection) {
-        return sendJson(res, 503, { error: '没有可用的默认模型：请先在设置里选一个，或在插件配置里写 provider/model' });
+      if (settings.engine === 'model' && settings.provider && settings.model) {
+        // 显式指定模型：仍然走宿主 llm（因此凭证/代理/审计都在宿主里），只是换 provider/model。
+        selection = { provider: settings.provider, model: settings.model };
+      } else if (!usingApi) {
+        // 否则问「这个会话实际路由到哪个模型」——和官方压缩调用同源（agent.session.requestHeader().config），
+        // 它一定带着可用的凭据；应用默认值只作兜底。
+        try {
+          const routed = agentBySession.get(sessionId)?.session?.requestHeader?.()?.config;
+          if (routed?.provider && routed?.model) selection = { provider: routed.provider, model: routed.model };
+        } catch { /* 没有该会话时退回默认值 */ }
+        selection ??= pickSelection(scope, config);
+        if (!selection) {
+          return sendJson(res, 503, { error: '没有可用的默认模型：请先在设置里选一个，或在插件配置里写 provider/model' });
+        }
       }
+      const identity = usingApi ? { provider: `api:${settings.baseURL}`, model: settings.model } : selection;
       // 流式：校验通过后就发头，之后一行一个 JSON 对象（NDJSON）：
       //   {"delta":"…"}  增量文字
       //   {"error":"…"}  失败（含分片直方图与失败码）
       //   {"done":true}  正常结束
       // 用 JSON 行而不是裸文本，因为译文里本来就有换行，裸文本没法区分"内容"与"结束"。
-      const cacheKey = translateCacheKey(selection, text);
+      const cacheKey = translateCacheKey(identity, text);
       const cached = translateCache.get(cacheKey);
       res.writeHead(200, {
         'content-type': 'application/x-ndjson; charset=utf-8',
@@ -635,53 +732,67 @@ export function apply(ctx, config = {}) {
         translateCache.set(cacheKey, translation);
         while (translateCache.size > TRANSLATE_CACHE_MAX) translateCache.delete(translateCache.keys().next().value);
       };
+      /** One passage: the explicit API engine streams itself, everything else goes through the host. */
+      const runTranslation = (part, onDelta) => {
+        const maxTokens = translationMaxTokens(part);
+        if (usingApi) {
+          return translateViaApi({
+            baseURL: settings.baseURL,
+            apiKey: settings.apiKey,
+            model: settings.model,
+            text: part,
+            maxTokens,
+            onDelta,
+          });
+        }
+        return translateText(llm, selection, part, {
+          sessionId,
+          maxTokens,
+          reasoningEffort: config.translateReasoning,
+          onDelta,
+        });
+      };
       try {
         // 多段长选区：各段并行请求，第一段仍实时出字，其余段到了按顺序补。
         const paragraphs = splitParagraphs(text);
         const groups = paragraphs.length >= 2 && text.length >= 300 ? groupParagraphs(paragraphs, 3) : [];
         if (groups.length >= 2) {
           const buffers = groups.map(() => '');
-          const tasks = groups.map((part, i) => translateText(llm, selection, part, {
-            sessionId,
-            maxTokens: translationMaxTokens(part),
-            reasoningEffort: config.translateReasoning,
-            onDelta: i === 0 ? (delta) => push({ delta }) : (delta) => { buffers[i] += delta; },
-          }));
+          const tasks = groups.map((part, i) => runTranslation(part, i === 0 ? (delta) => push({ delta }) : (delta) => { buffers[i] += delta; }));
           const first = await tasks[0];
           if (!first.translation) {
-            push({ error: translateFailureText(selection, first) });
+            push({ error: translateFailureText(identity, first) });
           } else if (first.truncated) {
-            // 半截译文不能当成功：不缓存，也不显示，让用户重试或缩小选区。
-            push({ error: translateTruncatedText(first) });
+            // 半截译文不写缓存，但已经流到气泡里的文字要留住：给一行 warning 收尾，
+            // 让气泡显示「已显示的部分 + 被截断」而不是把看到的一半再抹掉。
+            push({ done: true, warning: translateTruncatedText(first) });
           } else {
             let combined = first.translation;
-            let truncated = null;
+            let warning = null;
             for (let i = 1; i < groups.length; i += 1) {
               const result = await tasks[i];
               if (!result.translation) {
-                push({ error: translateFailureText(selection, result) });
+                push({ error: translateFailureText(identity, result) });
                 combined = '';
                 break;
               }
-              if (result.truncated) { truncated = result; combined = ''; break; }
+              if (result.truncated) {
+                warning = translateTruncatedText(result);
+                break;
+              }
               push({ delta: `\n\n${result.translation}` });
               combined += `\n\n${result.translation}`;
             }
-            if (truncated) push({ error: translateTruncatedText(truncated) });
+            if (warning) push({ done: true, warning });
             else if (combined) {
               remember(combined);
               push({ done: true });
             }
           }
         } else {
-          const result = await translateText(llm, selection, text, {
-            sessionId,
-            maxTokens: translationMaxTokens(text),
-            reasoningEffort: config.translateReasoning,
-            onDelta: (delta) => push({ delta }),
-          });
-          if (!result.translation) push({ error: translateFailureText(selection, result) });
-          else if (result.truncated) push({ error: translateTruncatedText(result) });
+          const result = await runTranslation(text, (delta) => push({ delta }));
+          if (!result.translation) push({ error: translateFailureText(identity, result) });
+          else if (result.truncated) push({ done: true, warning: translateTruncatedText(result) });
           else {
             remember(result.translation);
             push({ done: true });

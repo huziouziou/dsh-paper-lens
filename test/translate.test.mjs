@@ -171,6 +171,32 @@ test('a max-tokens finish is flagged, so half a translation is never shown as wh
   assert.equal(out.truncated, true);
 });
 
+test('an empty max-tokens finish retries with double the budget instead of failing', async () => {
+  let calls = 0;
+  const budgets = [];
+  const llm = {
+    stream(options) {
+      calls += 1;
+      budgets.push(options.maxTokens);
+      return (async function* () {
+        if (calls === 1) {
+          // 推理把 512 全花光了：一个文字分片都没有，直接以 max-tokens 收尾。
+          yield { type: 'finish', reason: 'max-tokens' };
+          return;
+        }
+        yield { type: 'text-delta', index: 0, text: '重试后的译文。' };
+        yield { type: 'finish', reason: 'stop' };
+      })();
+    },
+  };
+  const out = await translateText(llm, selection, 'x');
+  assert.equal(calls, 2);
+  assert.equal(budgets[0], 512);
+  assert.equal(budgets[1], 4096, '第二次预算按 2048 的底翻倍');
+  assert.equal(out.translation, '重试后的译文。');
+  assert.equal(out.truncated, false);
+});
+
 test('a finish(reason: error) from the effort probe is retried with a bigger budget', async () => {
   let calls = 0;
   const llm = {

@@ -24,6 +24,14 @@ const { useEffect, useRef, useState, useCallback } = React;
 export const PREVIEW_ID = 'dsh-paper-lens/pdf';
 /** 服务端的插件路由根（与 src/index.js 的 BASE 必须一致）。 */
 const PLUGIN_BASE = '/plugin-data/dsh-paper-lens';
+/** 翻译引擎设置的客户端默认值；真实值从 /config 来。 */
+const DEFAULT_ENGINE = { engine: 'session', provider: '', model: '', baseURL: '', hasKey: false };
+const DEFAULT_ENGINE_FORM = { engine: 'session', provider: '', model: '', baseURL: '', apiKey: '' };
+const ENGINES = [
+  ['session', '跟随会话'],
+  ['model', '指定模型'],
+  ['api', '自定义 API'],
+];
 // Every service apply() or the body touches must be declared, or the loader
 // refuses the read ("cannot get property … without inject").
 export const inject = ['slots', 'documentPreviews', 'sessions', 'conversation', 'sidebarRight'];
@@ -140,6 +148,16 @@ const CSS = [
   '.dpa-settings-row label{flex:none;width:74px;opacity:.8}',
   '.dpa-settings-row input[type=range]{flex:1;min-width:0;accent-color:var(--dsw-alias-brand-primary,#2563eb)}',
   '.dpa-settings-row output{width:52px;text-align:right;font-variant-numeric:tabular-nums}',
+  // 翻译引擎：跟随会话 / 指定模型 / 自定义 API。窄面板里字段竖排，输入框自己收缩。
+  '.dpa-engine{margin-top:10px;padding-top:8px;border-top:1px dashed var(--dsw-alias-border-l2,rgba(0,0,0,.14))}',
+  '.dpa-engine-head{font-weight:600;margin-bottom:6px}',
+  '.dpa-engine-fields{display:flex;flex-direction:column;gap:5px;margin:6px 0}',
+  '.dpa-engine-fields label{display:flex;align-items:center;gap:8px;font-size:12px;opacity:.9}',
+  '.dpa-engine-fields label>span{flex:none;width:64px;opacity:.8}',
+  '.dpa-engine-fields input{flex:1;min-width:0;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));border-radius:5px;padding:3px 6px;font:inherit;background:var(--dsw-alias-bg-layer-1,rgba(255,255,255,.7));color:inherit}',
+  '.dpa-engine-actions{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap}',
+  '.dpa-engine-note{font-size:11px;opacity:.8}',
+  '.dpa-engine-hint{font-size:11px;opacity:.65;margin-top:6px;line-height:1.5}',
   '.dpa-mark-detail{position:fixed;z-index:1004;width:300px;max-width:calc(100vw - 24px);padding:9px 11px;border-radius:9px;background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#1f2937);border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.14));box-shadow:0 10px 30px rgba(0,0,0,.3);font:12px/1.55 system-ui,sans-serif}',
   '.dpa-mark-detail .dpa-mark-quote{-webkit-line-clamp:5;margin:4px 0 8px}',
   '.dpa-mark-detail .dpa-detail-head{cursor:move;user-select:none;touch-action:none}',
@@ -157,6 +175,9 @@ const CSS = [
   '.dpa-tr-body.dpa-err{color:var(--dsw-alias-state-error-primary,#dc2626)}',
   '.dpa-tr-body.dpa-tr-loading{opacity:.9}',
   '.dpa-tr-caret{display:inline-block;width:2px;height:1em;margin-left:1px;vertical-align:text-bottom;background:currentColor;animation:dpa-blink 1s steps(1) infinite}',
+  '.dpa-tr-warn{margin-top:8px;padding-top:6px;border-top:1px dashed var(--dsw-alias-border-l2,rgba(0,0,0,.2));font-size:11px;line-height:1.5;color:var(--dsw-alias-state-warning-primary,#b45309)}',
+  '.dpa-tr-partial{margin-bottom:6px;opacity:.75}',
+  '.dpa-tr-elapsed{font-variant-numeric:tabular-nums;opacity:.75}',
   '@keyframes dpa-blink{0%,50%{opacity:1}50.01%,100%{opacity:0}}',
   '.dpa-center{padding:40px;text-align:center;color:var(--dsw-alias-label-secondary,#aaa)}',
   `::highlight(${HIGHLIGHT}){color:#60a5fa;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px}`,
@@ -304,6 +325,10 @@ function PdfAskBody(props) {
   /** 气泡被拖动后的位移（相对选区位置），null = 还没动过。 */
   const [trDrag, setTrDrag] = useState(null);
   const trBodyRef = useRef(null);
+  /** 正在跑的翻译请求；再点「译」或点「取消」时用它停掉上一个流。 */
+  const abortRef = useRef(null);
+  /** 流式翻译已经跑了多少秒；只在气泡头部显示，不参与请求。 */
+  const [elapsed, setElapsed] = useState(0);
   /** 引用按钮的预设提示词（插件配置可改；取不到时用内置）。 */
   const [prompts, setPrompts] = useState(DEFAULT_PROMPTS);
   const [promptMenu, setPromptMenu] = useState(false);
@@ -319,6 +344,12 @@ function PdfAskBody(props) {
   /** 字号与气泡宽度，localStorage 持久化。 */
   const [prefs, setPrefs] = useState(() => loadPrefs());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** 服务端保存的翻译引擎设置（key 只以 hasKey 的形式回来）。 */
+  const [engine, setEngine] = useState(DEFAULT_ENGINE);
+  /** 设置面板里正在编辑的一份；保存成功后再覆盖 engine。 */
+  const [engineForm, setEngineForm] = useState(DEFAULT_ENGINE_FORM);
+  const [engineBusy, setEngineBusy] = useState(false);
+  const [engineNote, setEngineNote] = useState('');
   const longPress = useRef(null);
   const longFired = useRef(false);
 
@@ -331,13 +362,19 @@ function PdfAskBody(props) {
     return () => clearTimeout(timer);
   }, [note]);
 
-  // Presets are server config; a fetch failure keeps the built-in three.
+  // Presets and the translation engine are server config; a fetch failure keeps
+  // the built-in presets and the "follow the chat" engine.
   useEffect(() => {
     let cancelled = false;
     fetch(`${PLUGIN_BASE}/config`, { headers: { accept: 'application/json' } })
       .then((response) => (response.ok ? response.json() : null))
       .then((data) => {
-        if (!cancelled && Array.isArray(data?.prompts)) setPrompts(data.prompts);
+        if (cancelled) return;
+        if (Array.isArray(data?.prompts)) setPrompts(data.prompts);
+        if (data?.translate) {
+          setEngine(data.translate);
+          setEngineForm({ ...data.translate, apiKey: '' });
+        }
       })
       .catch(() => { /* built-in presets */ });
     return () => { cancelled = true; };
@@ -362,6 +399,9 @@ function PdfAskBody(props) {
     viewRef.current = view;
     let cancelled = false;
     let unregister = () => {};
+    // Read the saved page BEFORE opening: build() used to report page 1, which
+    // overwrote this value in the same tick, so every re-open went back to 1.
+    const remembered = memory.get(address)?.page;
     setStatus({ phase: 'loading' });
     view.open(bytes).then(() => {
       if (cancelled) return;
@@ -376,8 +416,7 @@ function PdfAskBody(props) {
           view.setMarks(list, (mark, event) => openMark(mark, event));
         })
         .catch(() => { /* no marks file, or no session yet: start empty */ });
-      const remembered = memory.get(address)?.page;
-      if (remembered > 1) requestAnimationFrame(() => view.scrollToPage(remembered));
+      view.restorePage(remembered);
     }, (error) => {
       if (!cancelled) setStatus({ phase: 'error', message: String(error?.message ?? error) });
     });
@@ -407,7 +446,10 @@ function PdfAskBody(props) {
     }
     registry.touch(address);
     setPop(found);
-    setEnds(selectionEnds(selection));
+    // The toolbar is anchored to a visible line; with the whole selection above
+    // or below the viewport there is nothing to anchor to, so drop the handles
+    // too instead of leaving them at off-screen coordinates.
+    setEnds(found.anchor ? selectionEnds(selection) : null);
   }, [address]);
 
   useEffect(() => {
@@ -520,7 +562,7 @@ function PdfAskBody(props) {
   const translateSelection = async () => {
     if (!pop) return;
     const text = cleanSelection(pop.text);
-    const rect = pop.rect;
+    const rect = pop.anchor ?? pop.rect;
     setPop(null);
     setEnds(null);
     setTrDrag(null);
@@ -528,11 +570,20 @@ function PdfAskBody(props) {
       say('没有选中可翻译的文字', true);
       return;
     }
-    setTr({ phase: 'streaming', rect, text: '' });
+    // 上一段还没结束就又点了「译」：先停掉旧流，免两段译文混进同一个气泡。
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const startedAt = Date.now();
+    let acc = '';
+    setTr({ phase: 'streaming', rect, text: '', startedAt });
     // 原文已经拿到，清掉 PDF 上的选区：气泡压在选区上会看花，也让人以为气泡里的字被选住了。
     document.getSelection()?.removeAllRanges();
 
-    const fail = (error) => setTr({ phase: 'error', rect, error });
+    // 失败时保留已经流出来的半截：至少能看到译到哪儿，而不是一句空白的「失败」。
+    const fail = (error) => setTr({ phase: 'error', rect, error, text: acc, startedAt });
+    /** 服务端在结束时可能带一行 warning（截断但有半截译文），留给 done 一起收口。 */
+    let warning = null;
     try {
       const response = await fetch(`${PLUGIN_BASE}/translate`, {
         method: 'POST',
@@ -540,6 +591,7 @@ function PdfAskBody(props) {
         // 带上会话 id：服务端拿它做 llm.stream 的 sessionId——凭据与会话作用域由此解析，
         // 与官方压缩调用（passes agent.session.id）保持一致。
         body: JSON.stringify({ text, session: lastSessionId() }),
+        signal: controller.signal,
       });
       if (!response.ok || !response.body) {
         const data = await response.json().catch(() => null);
@@ -550,7 +602,6 @@ function PdfAskBody(props) {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
-      let acc = '';
       let painted = 0;
       // 增量可能一个 token 一行；每行都 setState 会让 React 疯狂重渲染，
       // 所以攒到 ~60ms 再刷一次，最后一个 delta 由结尾统一收口。
@@ -558,7 +609,7 @@ function PdfAskBody(props) {
         const now = Date.now();
         if (!force && now - painted < 60) return;
         painted = now;
-        setTr({ phase: 'streaming', rect, text: acc });
+        setTr({ phase: 'streaming', rect, text: acc, startedAt });
       };
 
       for (;;) {
@@ -573,6 +624,7 @@ function PdfAskBody(props) {
           if (!line) continue;
           let msg;
           try { msg = JSON.parse(line); } catch { continue; }
+          if (msg?.warning) warning = String(msg.warning);
           if (msg?.error) { fail(String(msg.error)); return; }
           if (typeof msg?.delta === 'string') { acc += msg.delta; paint(false); }
         }
@@ -581,6 +633,7 @@ function PdfAskBody(props) {
       if (buffer.trim()) {
         try {
           const msg = JSON.parse(buffer.trim());
+          if (msg?.warning) warning = String(msg.warning);
           if (msg?.error) { fail(String(msg.error)); return; }
           if (typeof msg?.delta === 'string') acc += msg.delta;
         } catch { /* 半个 JSON 就丢掉 */ }
@@ -588,11 +641,26 @@ function PdfAskBody(props) {
 
       const final = acc.trim();
       if (!final) { fail('模型没有返回译文'); return; }
-      setTr({ phase: 'done', rect, text: final });
+      setTr({ phase: 'done', rect, text: final, warning, startedAt });
     } catch (error) {
+      if (error?.name === 'AbortError') return;
       fail(`翻译失败：${error?.message ?? error}`);
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
     }
   };
+
+  // 流式时在气泡标题上走秒：等 5-8 秒才有第一个字时，没有时间显示就像卡死了。
+  useEffect(() => {
+    if (tr?.phase !== 'streaming') {
+      setElapsed(0);
+      return undefined;
+    }
+    const started = tr.startedAt ?? Date.now();
+    setElapsed((Date.now() - started) / 1000);
+    const timer = setInterval(() => setElapsed((Date.now() - started) / 1000), 250);
+    return () => clearInterval(timer);
+  }, [tr?.phase, tr?.startedAt]);
 
   /** 通用拖动：按住某处拖动浮层，位移相对它打开时的位置。 */
   const startFloatDrag = (event, base, setOffset) => {
@@ -671,17 +739,28 @@ function PdfAskBody(props) {
   /** Put the selection into the chat. Without a preset this is the plain 引用. */
   const send = (preset) => {
     if (!pop) return;
-    const block = formatQuote({ file, page: pop.page, text: pop.text, prompt: preset?.prompt });
+    // A selection crossing pages quotes as a range (p.3–4); the chat's citation
+    // parser accepts that, and the page link lands on where the passage starts.
+    const pages = pop.pages?.length ? pop.pages : [pop.page];
+    const span = pages.length > 1 ? `${pages[0]}–${pages[pages.length - 1]}` : String(pop.page);
+    const block = formatQuote({ file, page: span, text: pop.text, prompt: preset?.prompt });
     registry.remember(address, pop.page, pop.boxes);
     const okText = preset
-      ? `已加入会话（第 ${pop.page} 页，带「${preset.label}」提示词），按回车发送`
-      : `已引用第 ${pop.page} 页到会话，在下面写你的问题`;
+      ? `已加入会话（第 ${span} 页，带「${preset.label}」提示词），按回车发送`
+      : `已引用第 ${span} 页到会话，在下面写你的问题`;
     insertBlock(block, okText);
   };
 
   /** Save the current selection as an annotation in the PDF's marks/ directory. */
   const annotateSelection = async (strokeColor) => {
     if (!pop) return;
+    // A mark lives on one page and stores boxes relative to it; a selection that
+    // spans pages has no single page to draw on. Quoting and translating it is
+    // still fine, so only the annotation path asks for a page-sized selection.
+    if (pop.pages?.length > 1) {
+      say('这一段跨页了，批注先分页标注（引用和翻译不受影响）', true);
+      return;
+    }
     const mark = markFromSelection(pop, strokeColor);
     if (!mark) {
       say('没有可标注的文字', true);
@@ -690,11 +769,10 @@ function PdfAskBody(props) {
     }
     const session = marksSession();
     // 弹卡片的位置：选区左下角；卡片会被 markDetailStyle 收回窗口内。
-    const anchor = { x: pop.rect?.left ?? 160, y: pop.rect?.bottom ?? 120 };
+    const anchor = { x: pop.anchor?.left ?? pop.rect?.left ?? 160, y: pop.anchor?.bottom ?? pop.rect?.bottom ?? 120 };
     try {
       const saved = await saveMark({ session, path: pathOfAddress(address), mark });
       drawMarks([...marks, saved]);
-      setNoteDraft('');
       setNoteDraft('');
       setMarkDrag(null);
       setMarkDetail({ mark: saved, ...anchor });
@@ -772,6 +850,64 @@ function PdfAskBody(props) {
 
   const changePrefs = (patch) => setPrefs((current) => savePrefs({ ...current, ...patch }));
 
+  /** 保存翻译引擎设置；apiKey 只在这次输入过时才发，留空表示沿用已保存的 key。 */
+  const saveEngine = async () => {
+    setEngineBusy(true);
+    setEngineNote('');
+    try {
+      const body = {
+        engine: engineForm.engine,
+        provider: engineForm.provider,
+        model: engineForm.model,
+        baseURL: engineForm.baseURL,
+      };
+      if (engineForm.apiKey) body.apiKey = engineForm.apiKey;
+      const response = await fetch(`${PLUGIN_BASE}/config`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        setEngineNote(data?.error ?? `保存失败（HTTP ${response.status}）`);
+        return;
+      }
+      setEngine(data.translate);
+      setEngineForm({ ...data.translate, apiKey: '' });
+      setEngineNote('已保存');
+      say('翻译引擎设置已保存');
+    } catch (error) {
+      setEngineNote(`保存失败：${error?.message ?? error}`);
+    } finally {
+      setEngineBusy(false);
+    }
+  };
+
+  /** 清掉本机保存的 API key（地址和模型保留）。 */
+  const clearEngineKey = async () => {
+    setEngineBusy(true);
+    setEngineNote('');
+    try {
+      const response = await fetch(`${PLUGIN_BASE}/config`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ apiKey: '' }),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        setEngineNote(data?.error ?? `清除失败（HTTP ${response.status}）`);
+        return;
+      }
+      setEngine(data.translate);
+      setEngineForm({ ...data.translate, apiKey: '' });
+      setEngineNote('key 已清除');
+    } catch (error) {
+      setEngineNote(`清除失败：${error?.message ?? error}`);
+    } finally {
+      setEngineBusy(false);
+    }
+  };
+
   const view = viewRef.current;
   const ready = status.phase === 'ready';
   /** 跳到输入框里的页码；超出总页数时夹到最后一页，并把输入框改回真实页码。 */
@@ -794,10 +930,15 @@ function PdfAskBody(props) {
 
   const popStyle = pop
     ? (() => {
+        const anchor = pop.anchor;
+        if (!anchor) return { display: 'none' };
         const width = 340;
-        const left = Math.max(8, Math.min(window.innerWidth - width - 8, pop.rect.left + pop.rect.width / 2 - width / 2));
-        const above = pop.rect.top - 52;
-        return { left: `${left}px`, top: `${above > 8 ? above : pop.rect.bottom + 8}px` };
+        const barBottom = 48;
+        const left = Math.max(8, Math.min(window.innerWidth - width - 8, anchor.left + anchor.width / 2 - width / 2));
+        let top = anchor.top - 52;
+        if (top < barBottom) top = anchor.bottom + 8;
+        top = Math.max(barBottom, Math.min(window.innerHeight - 46, top));
+        return { left: `${left}px`, top: `${top}px` };
       })()
     : null;
 
@@ -849,7 +990,7 @@ function PdfAskBody(props) {
       note ? h('span', { className: `dpa-note${note.error ? ' dpa-err' : ''}`, title: note.text }, note.text) : h('span', { className: 'dpa-note' }, '选中文字即可翻译、引用或提问'),
       h('span', { className: 'dpa-spacer' }),
       h('button', { type: 'button', className: 'dpa-btn', title: '查看/删除本 PDF 的批注', onClick: () => { setMarksOpen((v) => !v); setSettingsOpen(false); setMarkDetail(null); } }, marks.length ? `批注 ${marks.length}` : '批注'),
-      h('button', { type: 'button', className: 'dpa-btn', title: '字号与气泡宽度', onClick: () => { setSettingsOpen((v) => !v); setMarksOpen(false); } }, '设置'),
+      h('button', { type: 'button', className: 'dpa-btn', title: '字号与气泡宽度', onClick: () => { const next = !settingsOpen; setSettingsOpen(next); setMarksOpen(false); if (next) { setEngineForm({ ...engine, apiKey: '' }); setEngineNote(''); } } }, '设置'),
       h('button', { type: 'button', className: 'dpa-btn', title: '缩小', disabled: !ready, onClick: () => zoom(-1) }, '−'),
       h('span', { style: { minWidth: '38px', textAlign: 'center' } }, zoomLabel),
       h('button', { type: 'button', className: 'dpa-btn', title: '放大', disabled: !ready, onClick: () => zoom(1) }, '+'),
@@ -968,8 +1109,18 @@ function PdfAskBody(props) {
             h(
               'span',
               { className: 'dpa-tr-title' },
-              tr.phase === 'streaming' ? '正在翻译…' : tr.phase === 'error' ? '翻译失败' : '译文',
+              tr.phase === 'streaming'
+                ? (elapsed >= 1 ? `正在翻译… ${Math.floor(elapsed)}s` : '正在翻译…')
+                : tr.phase === 'error' ? '翻译失败' : tr.warning ? '译文（被截断）' : '译文',
             ),
+            tr.phase === 'streaming'
+              ? h('button', {
+                  type: 'button',
+                  title: '停止这次翻译',
+                  onPointerDown: (event) => event.stopPropagation(),
+                  onClick: () => { abortRef.current?.abort(); setTr(null); },
+                }, '取消')
+              : null,
             h('button', {
               type: 'button',
               className: 'dpa-tr-copy',
@@ -991,8 +1142,20 @@ function PdfAskBody(props) {
               ref: trBodyRef,
               className: `dpa-tr-body${tr.phase === 'error' ? ' dpa-err' : ''}${tr.phase === 'streaming' ? ' dpa-tr-loading' : ''}`,
             },
-            tr.phase === 'error' ? tr.error : (tr.text || (tr.phase === 'streaming' ? '' : '')),
-            tr.phase === 'streaming' ? h('span', { className: 'dpa-tr-caret', 'aria-hidden': 'true' }) : null,
+            tr.phase === 'error'
+              ? h(
+                  'div',
+                  null,
+                  tr.text ? h('div', { className: 'dpa-tr-partial' }, tr.text) : null,
+                  h('div', null, tr.error),
+                )
+              : h(
+                  'div',
+                  null,
+                  tr.text,
+                  tr.warning ? h('div', { className: 'dpa-tr-warn' }, tr.warning) : null,
+                  tr.phase === 'streaming' ? h('span', { className: 'dpa-tr-caret', 'aria-hidden': 'true' }) : null,
+                ),
           ),
         )
       : null,
@@ -1091,6 +1254,83 @@ function PdfAskBody(props) {
               onChange: (event) => changePrefs({ bubbleWidth: Number(event.target.value) }),
             }),
             h('output', null, `${prefs.bubbleWidth}px`),
+          ),
+          h(
+            'div',
+            { className: 'dpa-engine' },
+            h('div', { className: 'dpa-engine-head' }, '翻译引擎'),
+            h(
+              'div',
+              { className: 'dpa-theme-row', role: 'group', 'aria-label': '翻译引擎' },
+              ENGINES.map(([value, label]) => h('button', {
+                key: value,
+                type: 'button',
+                'aria-pressed': engineForm.engine === value ? 'true' : 'false',
+                onClick: () => setEngineForm((form) => ({ ...form, engine: value })),
+              }, label)),
+            ),
+            engineForm.engine === 'model'
+              ? h(
+                  'div',
+                  { className: 'dpa-engine-fields' },
+                  h('label', null, h('span', null, 'provider'), h('input', {
+                    value: engineForm.provider,
+                    placeholder: 'opencode-go',
+                    onChange: (event) => setEngineForm((form) => ({ ...form, provider: event.target.value })),
+                  })),
+                  h('label', null, h('span', null, 'model'), h('input', {
+                    value: engineForm.model,
+                    placeholder: 'claude-haiku-5-5',
+                    onChange: (event) => setEngineForm((form) => ({ ...form, model: event.target.value })),
+                  })),
+                )
+              : null,
+            engineForm.engine === 'api'
+              ? h(
+                  'div',
+                  { className: 'dpa-engine-fields' },
+                  h('label', null, h('span', null, '接口地址'), h('input', {
+                    value: engineForm.baseURL,
+                    placeholder: 'https://api.example.com/v1',
+                    onChange: (event) => setEngineForm((form) => ({ ...form, baseURL: event.target.value })),
+                  })),
+                  h('label', null, h('span', null, '模型名'), h('input', {
+                    value: engineForm.model,
+                    placeholder: 'gpt-4o-mini',
+                    onChange: (event) => setEngineForm((form) => ({ ...form, model: event.target.value })),
+                  })),
+                  h('label', null, h('span', null, 'API key'), h('input', {
+                    type: 'password',
+                    value: engineForm.apiKey,
+                    placeholder: engine.hasKey ? '已保存；留空不修改' : '可留空（本地模型）',
+                    onChange: (event) => setEngineForm((form) => ({ ...form, apiKey: event.target.value })),
+                  })),
+                )
+              : null,
+            h(
+              'div',
+              { className: 'dpa-engine-actions' },
+              h('button', {
+                type: 'button',
+                className: 'dpa-btn',
+                disabled: engineBusy,
+                onClick: saveEngine,
+              }, engineBusy ? '保存中…' : '保存引擎设置'),
+              engine.engine === 'api' && engine.hasKey
+                ? h('button', {
+                    type: 'button',
+                    className: 'dpa-small',
+                    disabled: engineBusy,
+                    onClick: clearEngineKey,
+                  }, '清除 key')
+                : null,
+              engineNote ? h('span', { className: 'dpa-engine-note' }, engineNote) : null,
+            ),
+            h('div', { className: 'dpa-engine-hint' }, engineForm.engine === 'session'
+              ? '默认：用当前对话实际路由的模型和凭据，不额外配置。'
+              : engineForm.engine === 'model'
+                ? '仍走宿主的模型服务（凭据、代理都在宿主里），只换 provider/model；名字必须和宿主里已配置的对得上。'
+                : '直连 OpenAI 兼容的 /chat/completions；key 只保存在本机的 dsh-paper-lens.json 里。'),
           ),
           h('button', {
             type: 'button',

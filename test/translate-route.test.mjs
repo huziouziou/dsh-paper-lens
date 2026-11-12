@@ -277,7 +277,7 @@ test('paragraphs are translated in parallel and emitted in reading order', async
   }
 });
 
-test('a truncated translation is reported and never cached', async () => {
+test('a truncated translation keeps the half text, warns, and is never cached', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dpl-route-'));
   try {
     let calls = 0;
@@ -293,8 +293,9 @@ test('a truncated translation is reported and never cached', async () => {
 
     const first = await request(handler, { text: 'Hello.' });
     const firstLines = lines(first);
-    assert.equal(firstLines.some((l) => l.done), false, '截断不能以 done 结束');
-    assert.match(firstLines.find((l) => l.error)?.error ?? '', /被截断/);
+    assert.deepEqual(firstLines[0], { delta: '半句' }, '已经流出来的文字要留住');
+    assert.equal(firstLines.some((l) => l.done), true, '截断也要正常收口，气泡才知道停止');
+    assert.match(firstLines.find((l) => l.warning)?.warning ?? '', /被截断/);
 
     const second = await request(handler, { text: 'Hello.' });
     assert.equal(calls, 2, '半截译文不写缓存，第二次仍然请求模型');
