@@ -13,6 +13,7 @@
 import * as pdfjs from 'pdfjs-dist';
 import { attachSelectionFix } from './selection.js';
 import { findInItems, boxesFor, searchOrder } from './textsearch.js';
+import { isMarginFurniture } from './margins.js';
 
 let sharedWorker; // undefined: not made yet; null: none (tests)
 
@@ -685,12 +686,10 @@ function medianFontSize(pieces) {
 /**
  * The body size of a whole page, not just the selected pieces: a licence strip
  * can outnumber the body lines inside the selection and drag the median down,
- * which would make every line look like body text. Cached per page element; the
- * ratio between sizes is what matters, so a zoom keeps the cached value usable.
+ * which would make every line look like body text. Recomputed per selection: a
+ * cached value taken while the text layer was still filling in would stick.
  */
-const pageBodySizes = new WeakMap();
 function pageBodySize(pageEl) {
-  if (pageBodySizes.has(pageEl)) return pageBodySizes.get(pageEl);
   const sizes = [];
   const walker = document.createTreeWalker(pageEl, NodeFilter.SHOW_TEXT, {
     acceptNode(text) {
@@ -705,7 +704,6 @@ function pageBodySize(pageEl) {
   }
   sizes.sort((a, b) => a - b);
   const body = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 0;
-  pageBodySizes.set(pageEl, body);
   return body;
 }
 
@@ -720,10 +718,9 @@ function selectionText(groups) {
       const small = body > 0 && piece.fontSize > 0 && piece.fontSize < body * 0.95;
       const fromTop = piece.rect.top - pageRect.top;
       const fromBottom = pageRect.bottom - piece.rect.bottom;
-      // Small type right at the top of a page we are passing into, or right at the
-      // bottom of a page we are passing out of, is furniture, not the passage.
-      if (small && !firstPage && fromTop < pageRect.height * 0.16) continue;
-      if (small && !lastPage && fromBottom < pageRect.height * 0.1) continue;
+      // Running heads and license banners at the page edge are furniture, not the
+      // passage (see margins.js for why a hard band is needed).
+      if (isMarginFurniture({ first: firstPage, last: lastPage, small, top: fromTop, bottom: fromBottom, height: pageRect.height })) continue;
       const line = lines[lines.length - 1];
       if (line && line.pageEl === group.pageEl && Math.abs(piece.rect.top - line.top) < Math.max(2, line.height * 0.6)) {
         line.text += piece.text;
