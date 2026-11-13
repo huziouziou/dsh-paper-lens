@@ -25,7 +25,7 @@ export function chatCompletionsUrl(baseURL) {
  */
 export async function translateViaApi(options, env = {}) {
   const {
-    baseURL, apiKey, model, text, maxTokens, onDelta, signal,
+    baseURL, apiKey, model, text, maxTokens, onDelta, signal, targetLang,
   } = options;
   const fetchImpl = env.fetchImpl ?? fetch;
   const url = chatCompletionsUrl(baseURL);
@@ -41,7 +41,7 @@ export async function translateViaApi(options, env = {}) {
       model,
       stream: true,
       max_tokens: maxTokens,
-      messages: [{ role: 'user', content: translatePrompt(String(text ?? ''), 'compact') }],
+      messages: [{ role: 'user', content: translatePrompt(String(text ?? ''), 'compact', targetLang) }],
     }),
     ...(signal ? { signal } : {}),
   });

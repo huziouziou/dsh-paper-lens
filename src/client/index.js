@@ -25,8 +25,21 @@ export const PREVIEW_ID = 'dsh-paper-lens/pdf';
 /** 服务端的插件路由根（与 src/index.js 的 BASE 必须一致）。 */
 const PLUGIN_BASE = '/plugin-data/dsh-paper-lens';
 /** 翻译引擎设置的客户端默认值；真实值从 /config 来。 */
-const DEFAULT_ENGINE = { engine: 'session', provider: '', model: '', baseURL: '', hasKey: false };
-const DEFAULT_ENGINE_FORM = { engine: 'session', provider: '', model: '', baseURL: '', apiKey: '' };
+const DEFAULT_ENGINE = { engine: 'session', provider: '', model: '', baseURL: '', hasKey: false, targetLang: 'zh-Hans', reasoning: 'auto' };
+const DEFAULT_ENGINE_FORM = { engine: 'session', provider: '', model: '', baseURL: '', apiKey: '', targetLang: 'zh-Hans', reasoning: 'auto' };
+const LANGS = [
+  ['zh-Hans', '简体中文'],
+  ['zh-Hant', '繁體中文'],
+  ['en', 'English'],
+  ['ja', '日本語'],
+  ['ko', '한국어'],
+  ['de', 'Deutsch'],
+  ['fr', 'Français'],
+  ['es', 'Español'],
+  ['ru', 'Русский'],
+  ['ar', 'العربية'],
+];
+const REASONING = [['auto', '自动'], ['off', '关闭'], ['low', '低'], ['medium', '中'], ['high', '高']];
 const ENGINES = [
   ['session', '跟随会话'],
   ['model', '指定模型'],
@@ -155,6 +168,7 @@ const CSS = [
   '.dpa-engine-fields label{display:flex;align-items:center;gap:8px;font-size:12px;opacity:.9}',
   '.dpa-engine-fields label>span{flex:none;width:64px;opacity:.8}',
   '.dpa-engine-fields input{flex:1;min-width:0;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));border-radius:5px;padding:3px 6px;font:inherit;background:var(--dsw-alias-bg-layer-1,rgba(255,255,255,.7));color:inherit}',
+  '.dpa-engine-fields select{flex:1;min-width:0;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));border-radius:5px;padding:3px 6px;font:inherit;background:var(--dsw-alias-bg-layer-1,rgba(255,255,255,.7));color:inherit}',
   '.dpa-engine-actions{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap}',
   '.dpa-engine-note{font-size:11px;opacity:.8}',
   '.dpa-engine-hint{font-size:11px;opacity:.65;margin-top:6px;line-height:1.5}',
@@ -860,6 +874,8 @@ function PdfAskBody(props) {
         provider: engineForm.provider,
         model: engineForm.model,
         baseURL: engineForm.baseURL,
+        targetLang: engineForm.targetLang,
+        reasoning: engineForm.reasoning,
       };
       if (engineForm.apiKey) body.apiKey = engineForm.apiKey;
       const response = await fetch(`${PLUGIN_BASE}/config`, {
@@ -1331,6 +1347,34 @@ function PdfAskBody(props) {
               : engineForm.engine === 'model'
                 ? '仍走宿主的模型服务（凭据、代理都在宿主里），只换 provider/model；名字必须和宿主里已配置的对得上。'
                 : '直连 OpenAI 兼容的 /chat/completions；key 只保存在本机的 dsh-paper-lens.json 里。'),
+          ),
+          h(
+            'div',
+            { className: 'dpa-engine' },
+            h('div', { className: 'dpa-engine-head' }, '译文'),
+            h(
+              'div',
+              { className: 'dpa-engine-fields' },
+              h('label', null, h('span', null, '语言'), h('select', {
+                value: engineForm.targetLang,
+                onChange: (event) => setEngineForm((form) => ({ ...form, targetLang: event.target.value })),
+              }, LANGS.map(([value, label]) => h('option', { key: value, value }, label)))),
+            ),
+            engineForm.engine !== 'api'
+              ? h(
+                  'div',
+                  { className: 'dpa-theme-row', role: 'group', 'aria-label': '推理强度' },
+                  REASONING.map(([value, label]) => h('button', {
+                    key: value,
+                    type: 'button',
+                    'aria-pressed': engineForm.reasoning === value ? 'true' : 'false',
+                    onClick: () => setEngineForm((form) => ({ ...form, reasoning: value })),
+                  }, label)),
+                )
+              : null,
+            h('div', { className: 'dpa-engine-hint' }, engineForm.engine === 'api'
+              ? '自定义 API 的推理档位由对端模型自己决定，这里不生效。'
+              : '「自动」沿用插件配置里的 translateReasoning；模型不支持时会在没出字前退回不带该参数。'),
           ),
           h('button', {
             type: 'button',

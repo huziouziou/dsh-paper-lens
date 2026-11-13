@@ -94,6 +94,30 @@ function service(ctx, id) {
 /** The three ways a translation can find a model. */
 export const TRANSLATE_ENGINES = ['session', 'model', 'api'];
 
+/** 译文的目标语言；写进提示词，也写进缓存键（换语言不能复用旧译文）。 */
+export const TARGET_LANGS = [
+  ['zh-Hans', '简体中文'],
+  ['zh-Hant', '繁體中文'],
+  ['en', 'English'],
+  ['ja', '日本語'],
+  ['ko', '한국어'],
+  ['de', 'Deutsch'],
+  ['fr', 'Français'],
+  ['es', 'Español'],
+  ['ru', 'Русский'],
+  ['ar', 'العربية'],
+];
+export const DEFAULT_TARGET_LANG = 'zh-Hans';
+const LANG_LABELS = new Map(TARGET_LANGS);
+
+/** 推理强度：auto 沿用插件配置（`translateReasoning`），其余显式下发。 */
+export const REASONING_LEVELS = ['auto', 'off', 'low', 'medium', 'high'];
+
+export function normalizeTargetLang(value) {
+  const lang = String(value ?? '').trim();
+  return LANG_LABELS.has(lang) ? lang : DEFAULT_TARGET_LANG;
+}
+
 /** The stored shape; anything malformed falls back to following the chat. */
 export function normalizeTranslateSettings(raw) {
   const src = raw && typeof raw === 'object' ? raw : {};
@@ -104,6 +128,8 @@ export function normalizeTranslateSettings(raw) {
     model: text(src.model),
     baseURL: text(src.baseURL),
     apiKey: typeof src.apiKey === 'string' ? src.apiKey : '',
+    targetLang: normalizeTargetLang(src.targetLang),
+    reasoning: REASONING_LEVELS.includes(src.reasoning) ? src.reasoning : 'auto',
   };
 }
 
@@ -116,6 +142,8 @@ export function publicTranslateSettings(settings) {
     model: safe.model,
     baseURL: safe.baseURL,
     hasKey: Boolean(safe.apiKey),
+    targetLang: safe.targetLang,
+    reasoning: safe.reasoning,
   };
 }
 
@@ -207,9 +235,9 @@ export function groupParagraphs(parts, max = 3) {
   return out;
 }
 
-/** 同选区缓存的键：模型与原文都算进去，换模型不会拿到旧译文。 */
-export function translateCacheKey(selection, text) {
-  return `${selection?.provider ?? ''}/${selection?.model ?? ''}\n${text}`;
+/** 同选区缓存的键：模型、目标语言与原文都算进去，换任何一个都不复用旧译文。 */
+export function translateCacheKey(selection, text, targetLang = DEFAULT_TARGET_LANG) {
+  return `${selection?.provider ?? ''}/${selection?.model ?? ''}\n${normalizeTargetLang(targetLang)}\n${text}`;
 }
 
 
@@ -220,14 +248,15 @@ export function translateCacheKey(selection, text) {
  * 公式与变量名要求原样保留，因为 PDF 文本层里的公式本来就是残缺的（`$F_\\theta$` 常只剩
  * `F`），再让模型"顺手翻译"只会更糟。
  */
-export function translatePrompt(text, style = 'full') {
+export function translatePrompt(text, style = 'full', target = DEFAULT_TARGET_LANG) {
+  const lang = LANG_LABELS.get(normalizeTargetLang(target)) ?? '简体中文';
   if (style === 'compact') {
     // MT models (and small local ones) follow a short text-first instruction
     // better: with the rule list in front they sometimes start by repeating it.
-    return ['原文：', text, '', '请把上面的英文翻译成简体中文，只输出译文，不要解释。'].join('\n');
+    return ['原文：', text, '', `请把上面的文本翻译成${lang}，只输出译文，不要解释。`].join('\n');
   }
   return [
-    '把下面这段英文翻译成简体中文。',
+    `把下面这段文本翻译成${lang}。`,
     '',
     '规则：',
     '1. 只输出译文本身。不要前言、不要解释、不要重复原文、不要加引号或代码块。',
@@ -257,7 +286,7 @@ export function pickSelection(scope, config = {}) {
  * 界面是流式的（边出边看），所以正常路径下 `out` 只是给调用方核对用的；
  * 只有「模型没给出任何文字」时才用它判断失败。
  */
-export async function translateText(llm, selection, text, { maxChars = MAX_TRANSLATE_CHARS, sessionId, onDelta, maxTokens, reasoningEffort = 'off' } = {}) {
+export async function translateText(llm, selection, text, { maxChars = MAX_TRANSLATE_CHARS, sessionId, onDelta, maxTokens, reasoningEffort = 'off', targetLang = DEFAULT_TARGET_LANG } = {}) {
   const clipped = String(text ?? '').slice(0, maxChars);
   let out = '';
   const chunkKinds = {};
@@ -268,7 +297,7 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
   const request = (extra = {}) => ({
     provider: selection.provider,
     model: selection.model,
-    messages: [{ role: 'user', content: [{ type: 'text', text: translatePrompt(clipped) }] }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: translatePrompt(clipped, 'full', targetLang) }] }],
     maxTokens: maxTokens ?? translationMaxTokens(clipped),
     ...(sessionId ? { sessionId } : {}),
     ...extra,
@@ -580,6 +609,14 @@ export function apply(ctx, config = {}) {
         if (typeof body.apiKey !== 'string') return sendJson(res, 400, { error: 'apiKey 必须是字符串' });
         patch.apiKey = body.apiKey;
       }
+      if ('targetLang' in body) {
+        if (!TARGET_LANGS.some(([code]) => code === body.targetLang)) return sendJson(res, 400, { error: 'targetLang 不在支持列表里' });
+        patch.targetLang = body.targetLang;
+      }
+      if ('reasoning' in body) {
+        if (!REASONING_LEVELS.includes(body.reasoning)) return sendJson(res, 400, { error: 'reasoning 只能是 auto/off/low/medium/high' });
+        patch.reasoning = body.reasoning;
+      }
       const merged = normalizeTranslateSettings({ ...modes.translate(), ...patch });
       if (merged.engine === 'model' && (!merged.provider || !merged.model)) {
         return sendJson(res, 400, { error: '指定模型需要同时填 provider 和 model' });
@@ -686,6 +723,9 @@ export function apply(ctx, config = {}) {
         return sendJson(res, 413, { error: `文本过长，上限 ${MAX_TRANSLATE_CHARS} 字符` });
       }
       const settings = modes.translate();
+      const targetLang = normalizeTargetLang(settings.targetLang);
+      // 「自动」沿用插件配置；其余档位由用户在设置里显式选择。
+      const reasoningEffort = settings.reasoning === 'auto' ? config.translateReasoning : settings.reasoning;
       // 「自定义 API」是显式选择：不走宿主 llm，也不需要会话凭据。
       const usingApi = settings.engine === 'api' && Boolean(settings.baseURL && settings.model);
       const llm = scope.llm;
@@ -712,7 +752,7 @@ export function apply(ctx, config = {}) {
       //   {"error":"…"}  失败（含分片直方图与失败码）
       //   {"done":true}  正常结束
       // 用 JSON 行而不是裸文本，因为译文里本来就有换行，裸文本没法区分"内容"与"结束"。
-      const cacheKey = translateCacheKey(identity, text);
+      const cacheKey = translateCacheKey(identity, text, targetLang);
       const cached = translateCache.get(cacheKey);
       res.writeHead(200, {
         'content-type': 'application/x-ndjson; charset=utf-8',
@@ -747,13 +787,15 @@ export function apply(ctx, config = {}) {
             model: settings.model,
             text: part,
             maxTokens,
+            targetLang,
             onDelta,
           });
         }
         return translateText(llm, selection, part, {
           sessionId,
           maxTokens,
-          reasoningEffort: config.translateReasoning,
+          reasoningEffort,
+          targetLang,
           onDelta,
         });
       };

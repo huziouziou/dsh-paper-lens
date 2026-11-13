@@ -62,19 +62,23 @@ async function call(handler, { method = 'GET', url = '/', body } = {}) {
 
 test('translate settings default to following the chat, and junk is ignored', () => {
   assert.deepEqual(normalizeTranslateSettings(null), {
-    engine: 'session', provider: '', model: '', baseURL: '', apiKey: '',
+    engine: 'session', provider: '', model: '', baseURL: '', apiKey: '', targetLang: 'zh-Hans', reasoning: 'auto',
   });
   const kept = normalizeTranslateSettings({
-    engine: 'api', provider: ' p ', model: 'm', baseURL: ' https://x/v1 ', apiKey: 'k',
+    engine: 'api', provider: ' p ', model: 'm', baseURL: ' https://x/v1 ', apiKey: 'k', targetLang: 'ja', reasoning: 'high',
   });
-  assert.deepEqual(kept, { engine: 'api', provider: 'p', model: 'm', baseURL: 'https://x/v1', apiKey: 'k' });
+  assert.deepEqual(kept, { engine: 'api', provider: 'p', model: 'm', baseURL: 'https://x/v1', apiKey: 'k', targetLang: 'ja', reasoning: 'high' });
   assert.equal(normalizeTranslateSettings({ engine: 'nope', apiKey: 42 }).engine, 'session');
   assert.equal(normalizeTranslateSettings({ engine: 'nope', apiKey: 42 }).apiKey, '');
+  assert.equal(normalizeTranslateSettings({ targetLang: 'klingon', reasoning: 'max' }).targetLang, 'zh-Hans');
+  assert.equal(normalizeTranslateSettings({ targetLang: 'klingon', reasoning: 'max' }).reasoning, 'auto');
 });
 
 test('the public view never carries the key, only whether one is saved', () => {
   const shown = publicTranslateSettings({ engine: 'api', baseURL: 'https://x', model: 'm', apiKey: 'secret' });
-  assert.deepEqual(shown, { engine: 'api', provider: '', model: 'm', baseURL: 'https://x', hasKey: true });
+  assert.deepEqual(shown, {
+    engine: 'api', provider: '', model: 'm', baseURL: 'https://x', hasKey: true, targetLang: 'zh-Hans', reasoning: 'auto',
+  });
   assert.equal('apiKey' in shown, false);
 });
 
@@ -94,7 +98,7 @@ test('the config route saves the engine, hides the key, and keeps it when omitte
     });
     assert.equal(saved.status, 200);
     assert.deepEqual(saved.json.translate, {
-      engine: 'api', provider: '', model: 'fast', baseURL: 'https://api.example.com/v1', hasKey: true,
+      engine: 'api', provider: '', model: 'fast', baseURL: 'https://api.example.com/v1', hasKey: true, targetLang: 'zh-Hans', reasoning: 'auto',
     });
     assert.equal(saved.body.includes('sk-local'), false, 'the key never comes back');
 
@@ -117,6 +121,28 @@ test('the config route saves the engine, hides the key, and keeps it when omitte
   }
 });
 
+test('the config route saves the language and reasoning level, and rejects unknown ones', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dpl-lang-'));
+  try {
+    const routes = harness(join(dir, 'state.json'));
+    const route = routes[`${BASE}/config`];
+
+    assert.equal((await call(route, { method: 'POST', body: { targetLang: 'xx' } })).status, 400);
+    assert.equal((await call(route, { method: 'POST', body: { reasoning: 'max' } })).status, 400);
+
+    const saved = await call(route, { method: 'POST', body: { targetLang: 'ja', reasoning: 'high' } });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.json.translate.targetLang, 'ja');
+    assert.equal(saved.json.translate.reasoning, 'high');
+
+    const listed = await call(route);
+    assert.equal(listed.json.translate.targetLang, 'ja');
+    assert.equal(createModeStore(join(dir, 'state.json')).translate().reasoning, 'high');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('the endpoint is a base URL or already a full completions URL', () => {
   assert.equal(chatCompletionsUrl(''), '');
   assert.equal(chatCompletionsUrl(' https://x/v1/ '), 'https://x/v1/chat/completions');
@@ -127,7 +153,7 @@ test('the API engine streams content and drops reasoning', async () => {
   const deltas = [];
   const bodies = [];
   const result = await translateViaApi({
-    baseURL: 'https://x/v1', apiKey: 'k', model: 'fast', text: 'Hello.', maxTokens: 99,
+    baseURL: 'https://x/v1', apiKey: 'k', model: 'fast', text: 'Hello.', maxTokens: 99, targetLang: 'ja',
     onDelta: (piece) => deltas.push(piece),
   }, {
     fetchImpl: async (_url, init) => {
@@ -147,6 +173,7 @@ test('the API engine streams content and drops reasoning', async () => {
   // sends the compact text-first prompt.
   assert.match(bodies[0].messages[0].content, /^原文：\nHello\./);
   assert.equal(bodies[0].messages[0].content.includes('规则：'), false);
+  assert.match(bodies[0].messages[0].content, /翻译成日本語/);
 });
 
 test('a length finish is flagged, and HTTP errors carry the detail', async () => {

@@ -124,11 +124,18 @@ test('paragraph splitting only fires on real blank-line breaks', () => {
   assert.deepEqual(groupParagraphs(['a', 'b', 'c', 'd'], 3), ['a\n\nb', 'c', 'd']);
 });
 
-test('the cache key includes the model, so switching models does not reuse the old text', () => {
-  assert.notEqual(
-    translateCacheKey({ provider: 'p', model: 'm1' }, 'x'),
-    translateCacheKey({ provider: 'p', model: 'm2' }, 'x'),
-  );
+test('the cache key includes the model and the target language', () => {
+  const sel = { provider: 'p', model: 'm1' };
+  assert.notEqual(translateCacheKey(sel, 'x'), translateCacheKey({ provider: 'p', model: 'm2' }, 'x'));
+  assert.notEqual(translateCacheKey(sel, 'x'), translateCacheKey(sel, 'x', 'ja'));
+  assert.equal(translateCacheKey(sel, 'x'), translateCacheKey(sel, 'x', 'zh-Hans'));
+});
+
+test('the prompt carries the chosen target language', () => {
+  assert.match(translatePrompt('Hi.', 'full', 'ja'), /翻译成日本語/);
+  assert.match(translatePrompt('Hi.', 'compact', 'de'), /翻译成Deutsch/);
+  // An unknown code must not leak into the prompt.
+  assert.match(translatePrompt('Hi.', 'full', 'klingon'), /翻译成简体中文/);
 });
 
 test('translation asks the model not to think, because reasoning eats the budget', async () => {
