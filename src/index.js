@@ -220,7 +220,12 @@ export function translateCacheKey(selection, text) {
  * 公式与变量名要求原样保留，因为 PDF 文本层里的公式本来就是残缺的（`$F_\\theta$` 常只剩
  * `F`），再让模型"顺手翻译"只会更糟。
  */
-export function translatePrompt(text) {
+export function translatePrompt(text, style = 'full') {
+  if (style === 'compact') {
+    // MT models (and small local ones) follow a short text-first instruction
+    // better: with the rule list in front they sometimes start by repeating it.
+    return ['原文：', text, '', '请把上面的英文翻译成简体中文，只输出译文，不要解释。'].join('\n');
+  }
   return [
     '把下面这段英文翻译成简体中文。',
     '',

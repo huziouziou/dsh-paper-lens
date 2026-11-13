@@ -125,20 +125,28 @@ test('the endpoint is a base URL or already a full completions URL', () => {
 
 test('the API engine streams content and drops reasoning', async () => {
   const deltas = [];
+  const bodies = [];
   const result = await translateViaApi({
     baseURL: 'https://x/v1', apiKey: 'k', model: 'fast', text: 'Hello.', maxTokens: 99,
     onDelta: (piece) => deltas.push(piece),
   }, {
-    fetchImpl: async () => sse([
-      'data: {"choices":[{"delta":{"reasoning_content":"thinking…"}}]}',
-      'data: {"choices":[{"delta":{"content":"你好"}}]}',
-      'data: {"choices":[{"delta":{"content":"。"},"finish_reason":"stop"}]}',
-      'data: [DONE]',
-    ]),
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(init.body));
+      return sse([
+        'data: {"choices":[{"delta":{"reasoning_content":"thinking…"}}]}',
+        'data: {"choices":[{"delta":{"content":"你好"}}]}',
+        'data: {"choices":[{"delta":{"content":"。"},"finish_reason":"stop"}]}',
+        'data: [DONE]',
+      ]);
+    },
   });
   assert.deepEqual(deltas, ['你好', '。']);
   assert.equal(result.translation, '你好。');
   assert.equal(result.truncated, false);
+  // Local MT models repeat the rule list when it comes first, so the API engine
+  // sends the compact text-first prompt.
+  assert.match(bodies[0].messages[0].content, /^原文：\nHello\./);
+  assert.equal(bodies[0].messages[0].content.includes('规则：'), false);
 });
 
 test('a length finish is flagged, and HTTP errors carry the detail', async () => {

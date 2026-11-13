@@ -41,7 +41,7 @@ export async function translateViaApi(options, env = {}) {
       model,
       stream: true,
       max_tokens: maxTokens,
-      messages: [{ role: 'user', content: translatePrompt(String(text ?? '')) }],
+      messages: [{ role: 'user', content: translatePrompt(String(text ?? ''), 'compact') }],
     }),
     ...(signal ? { signal } : {}),
   });
