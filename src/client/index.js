@@ -869,24 +869,30 @@ function PdfAskBody(props) {
   /** 文本框改动先留在表单里，等「保存引擎设置」；离散选项改动即保存。 */
   const markDirtyField = () => setEngineNote('有未保存的改动，点「保存引擎设置」生效');
 
-  /** 保存翻译引擎设置；apiKey 只在这次输入过时才发，留空表示沿用已保存的 key。 */
+  /** 保存翻译引擎设置。
+   *  带 patch 的调用来自「改动即生效」的离散选项，只发被改的那几项——避免用
+   *  面板里可能过期的文本框内容把别处刚保存的设置覆盖掉；不带 patch 的是「保存」
+   *  按钮，发整个表单。apiKey 只在这次输入过时才发，留空表示沿用已保存的 key。 */
   const saveEngine = async (patch) => {
-    const form = { ...engineForm, ...(patch && typeof patch === 'object' ? patch : {}) };
-    if (patch && typeof patch === 'object') setEngineForm(form);
+    const isPatch = Boolean(patch && typeof patch === 'object');
+    const form = { ...engineForm, ...(isPatch ? patch : {}) };
+    if (isPatch) setEngineForm(form);
     setEngineBusy(true);
     setEngineNote('');
     try {
-      const body = {
-        engine: form.engine,
-        provider: form.provider,
-        model: form.model,
-        baseURL: form.baseURL,
-        targetLang: form.targetLang,
-        reasoning: form.reasoning,
-        localCommand: form.localCommand,
-        localAutoStart: form.localAutoStart === true,
-      };
-      if (form.apiKey) body.apiKey = form.apiKey;
+      const body = isPatch
+        ? { ...patch }
+        : {
+            engine: form.engine,
+            provider: form.provider,
+            model: form.model,
+            baseURL: form.baseURL,
+            targetLang: form.targetLang,
+            reasoning: form.reasoning,
+            localCommand: form.localCommand,
+            localAutoStart: form.localAutoStart === true,
+            ...(form.apiKey ? { apiKey: form.apiKey } : {}),
+          };
       const response = await fetch(`${PLUGIN_BASE}/config`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -898,7 +904,8 @@ function PdfAskBody(props) {
         return;
       }
       setEngine(data.translate);
-      setEngineForm({ ...data.translate, apiKey: '' });
+      // 全量保存后以服务端为准；离散改动则保留正在编辑的文本框内容。
+      if (!isPatch) setEngineForm({ ...data.translate, apiKey: '' });
       setEngineNote('已保存');
       say('翻译引擎设置已保存');
     } catch (error) {
@@ -906,6 +913,17 @@ function PdfAskBody(props) {
     } finally {
       setEngineBusy(false);
     }
+  };
+
+  /** 打开设置面板前重新拉一次配置：别处（或另一个窗口）改过的值不会在这里显示成旧的。 */
+  const refreshEngine = async () => {
+    try {
+      const response = await fetch(`${PLUGIN_BASE}/config`);
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.translate) return;
+      setEngine(data.translate);
+      setEngineForm({ ...data.translate, apiKey: '' });
+    } catch { /* 拉不到就用手里的旧值 */ }
   };
 
   /** 清掉本机保存的 API key（地址和模型保留）。 */
@@ -1015,7 +1033,7 @@ function PdfAskBody(props) {
       note ? h('span', { className: `dpa-note${note.error ? ' dpa-err' : ''}`, title: note.text }, note.text) : h('span', { className: 'dpa-note' }, '选中文字即可翻译、引用或提问'),
       h('span', { className: 'dpa-spacer' }),
       h('button', { type: 'button', className: 'dpa-btn', title: '查看/删除本 PDF 的批注', onClick: () => { setMarksOpen((v) => !v); setSettingsOpen(false); setMarkDetail(null); } }, marks.length ? `批注 ${marks.length}` : '批注'),
-      h('button', { type: 'button', className: 'dpa-btn', title: '字号与气泡宽度', onClick: () => { const next = !settingsOpen; setSettingsOpen(next); setMarksOpen(false); if (next) { setEngineForm({ ...engine, apiKey: '' }); setEngineNote(''); } } }, '设置'),
+      h('button', { type: 'button', className: 'dpa-btn', title: '字号与气泡宽度', onClick: () => { const next = !settingsOpen; setSettingsOpen(next); setMarksOpen(false); if (next) { setEngineNote(''); refreshEngine(); } } }, '设置'),
       h('button', { type: 'button', className: 'dpa-btn', title: '缩小', disabled: !ready, onClick: () => zoom(-1) }, '−'),
       h('span', { style: { minWidth: '38px', textAlign: 'center' } }, zoomLabel),
       h('button', { type: 'button', className: 'dpa-btn', title: '放大', disabled: !ready, onClick: () => zoom(1) }, '+'),
