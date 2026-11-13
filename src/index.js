@@ -191,27 +191,6 @@ export function splitParagraphs(text) {
   return parts.length > 1 ? parts : [];
 }
 
-/**
- * 单段长文的句级分片：首片先出字，其余片并行，避免整段等模型把 1500 字想完。
- * 只在句末切，片长不超过 maxLen；分不出两片就返回 []，调用方仍走整段路径。
- */
-export function splitIntoChunks(text, maxLen = 420) {
-  const source = String(text ?? '').trim();
-  if (source.length <= maxLen) return [];
-  const sentences = source.match(/[^.!?。！？]+[.!?。！？]+["'”’)）]*\s*|[^.!?。！？]+$/g) ?? [source];
-  const chunks = [];
-  let current = '';
-  for (const sentence of sentences) {
-    if (current && current.length + sentence.length > maxLen) {
-      chunks.push(current.trim());
-      current = '';
-    }
-    current += sentence;
-  }
-  if (current.trim()) chunks.push(current.trim());
-  return chunks.length > 1 ? chunks : [];
-}
-
 /** 把 N 段并成至多 max 组，保持原顺序；组内仍用空行分隔。 */
 export function groupParagraphs(parts, max = 3) {
   if (parts.length <= max) return [...parts];
@@ -774,15 +753,11 @@ export function apply(ctx, config = {}) {
         });
       };
       try {
-        // 长选区并行：多段按段分组；单段长文按句切成片。第一片实时出字，
-        // 其余片先缓冲，轮到它时再补——首字不必等整段想完。
+        // 多段长选区：各段并行请求，第一段仍实时出字，其余段到了按顺序补。
+        // 单段不再切片：实测该模型每个请求都有数秒推理启动开销，三片并行反而更慢
+        // （1500 字：首字 6.0s / 整段 39.4s，对比整段单次 8.0s / 11.1s），故退回整段。
         const paragraphs = splitParagraphs(text);
-        const multiParagraph = paragraphs.length >= 2 && text.length >= 300;
-        const groups = multiParagraph
-          ? groupParagraphs(paragraphs, 3)
-          // 最多三片并行：片太碎会淹没提供商，片太大首字又慢。
-          : splitIntoChunks(text, Math.max(420, Math.ceil(text.length / 3)));
-        const gap = multiParagraph ? '\n\n' : '';
+        const groups = paragraphs.length >= 2 && text.length >= 300 ? groupParagraphs(paragraphs, 3) : [];
         if (groups.length >= 2) {
           const buffers = groups.map(() => '');
           const tasks = groups.map((part, i) => runTranslation(part, i === 0 ? (delta) => push({ delta }) : (delta) => { buffers[i] += delta; }));
@@ -807,8 +782,8 @@ export function apply(ctx, config = {}) {
                 warning = translateTruncatedText(result);
                 break;
               }
-              push({ delta: `${gap}${result.translation}` });
-              combined += `${gap}${result.translation}`;
+              push({ delta: `\n\n${result.translation}` });
+              combined += `\n\n${result.translation}`;
             }
             if (warning) push({ done: true, warning });
             else if (combined) {
