@@ -34,17 +34,28 @@ export async function translateViaApi(options, env = {}) {
 
   const headers = { 'content-type': 'application/json', accept: 'text/event-stream' };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-  const response = await fetchImpl(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model,
-      stream: true,
-      max_tokens: maxTokens,
-      messages: [{ role: 'user', content: translatePrompt(String(text ?? ''), 'compact', targetLang) }],
-    }),
-    ...(signal ? { signal } : {}),
-  });
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model,
+        stream: true,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: translatePrompt(String(text ?? ''), 'compact', targetLang) }],
+      }),
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    // fetch 的 "fetch failed" 对读者没有信息量：把地址和「服务是不是没开」说清楚。
+    if (error?.name === 'AbortError') throw error;
+    const base = String(baseURL ?? '').trim();
+    const local = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])/i.test(base);
+    throw new Error(
+      `连不上 ${base || '自定义 API'}${local ? '（本地服务没在运行，或地址/端口不对）' : ''}：${error?.message ?? error}`,
+    );
+  }
 
   if (!response.ok) {
     const detail = await response.text().catch(() => '');

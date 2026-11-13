@@ -25,8 +25,8 @@ export const PREVIEW_ID = 'dsh-paper-lens/pdf';
 /** 服务端的插件路由根（与 src/index.js 的 BASE 必须一致）。 */
 const PLUGIN_BASE = '/plugin-data/dsh-paper-lens';
 /** 翻译引擎设置的客户端默认值；真实值从 /config 来。 */
-const DEFAULT_ENGINE = { engine: 'session', provider: '', model: '', baseURL: '', hasKey: false, targetLang: 'zh-Hans', reasoning: 'auto' };
-const DEFAULT_ENGINE_FORM = { engine: 'session', provider: '', model: '', baseURL: '', apiKey: '', targetLang: 'zh-Hans', reasoning: 'auto' };
+const DEFAULT_ENGINE = { engine: 'session', provider: '', model: '', baseURL: '', hasKey: false, targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false };
+const DEFAULT_ENGINE_FORM = { engine: 'session', provider: '', model: '', baseURL: '', apiKey: '', targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false };
 const LANGS = [
   ['zh-Hans', '简体中文'],
   ['zh-Hant', '繁體中文'],
@@ -172,6 +172,8 @@ const CSS = [
   '.dpa-engine-actions{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap}',
   '.dpa-engine-note{font-size:11px;opacity:.8}',
   '.dpa-engine-hint{font-size:11px;opacity:.65;margin-top:6px;line-height:1.5}',
+  '.dpa-check{display:flex;align-items:center;gap:6px;font-size:12px;opacity:.9;margin-top:2px}',
+  '.dpa-check input{flex:none;margin:0}',
   '.dpa-mark-detail{position:fixed;z-index:1004;width:300px;max-width:calc(100vw - 24px);padding:9px 11px;border-radius:9px;background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#1f2937);border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.14));box-shadow:0 10px 30px rgba(0,0,0,.3);font:12px/1.55 system-ui,sans-serif}',
   '.dpa-mark-detail .dpa-mark-quote{-webkit-line-clamp:5;margin:4px 0 8px}',
   '.dpa-mark-detail .dpa-detail-head{cursor:move;user-select:none;touch-action:none}',
@@ -864,20 +866,27 @@ function PdfAskBody(props) {
 
   const changePrefs = (patch) => setPrefs((current) => savePrefs({ ...current, ...patch }));
 
+  /** 文本框改动先留在表单里，等「保存引擎设置」；离散选项改动即保存。 */
+  const markDirtyField = () => setEngineNote('有未保存的改动，点「保存引擎设置」生效');
+
   /** 保存翻译引擎设置；apiKey 只在这次输入过时才发，留空表示沿用已保存的 key。 */
-  const saveEngine = async () => {
+  const saveEngine = async (patch) => {
+    const form = { ...engineForm, ...(patch && typeof patch === 'object' ? patch : {}) };
+    if (patch && typeof patch === 'object') setEngineForm(form);
     setEngineBusy(true);
     setEngineNote('');
     try {
       const body = {
-        engine: engineForm.engine,
-        provider: engineForm.provider,
-        model: engineForm.model,
-        baseURL: engineForm.baseURL,
-        targetLang: engineForm.targetLang,
-        reasoning: engineForm.reasoning,
+        engine: form.engine,
+        provider: form.provider,
+        model: form.model,
+        baseURL: form.baseURL,
+        targetLang: form.targetLang,
+        reasoning: form.reasoning,
+        localCommand: form.localCommand,
+        localAutoStart: form.localAutoStart === true,
       };
-      if (engineForm.apiKey) body.apiKey = engineForm.apiKey;
+      if (form.apiKey) body.apiKey = form.apiKey;
       const response = await fetch(`${PLUGIN_BASE}/config`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -1282,7 +1291,7 @@ function PdfAskBody(props) {
                 key: value,
                 type: 'button',
                 'aria-pressed': engineForm.engine === value ? 'true' : 'false',
-                onClick: () => setEngineForm((form) => ({ ...form, engine: value })),
+                onClick: () => saveEngine({ engine: value }),
               }, label)),
             ),
             engineForm.engine === 'model'
@@ -1292,12 +1301,12 @@ function PdfAskBody(props) {
                   h('label', null, h('span', null, 'provider'), h('input', {
                     value: engineForm.provider,
                     placeholder: 'opencode-go',
-                    onChange: (event) => setEngineForm((form) => ({ ...form, provider: event.target.value })),
+                    onChange: (event) => { setEngineForm((form) => ({ ...form, provider: event.target.value })); markDirtyField(); },
                   })),
                   h('label', null, h('span', null, 'model'), h('input', {
                     value: engineForm.model,
                     placeholder: 'claude-haiku-5-5',
-                    onChange: (event) => setEngineForm((form) => ({ ...form, model: event.target.value })),
+                    onChange: (event) => { setEngineForm((form) => ({ ...form, model: event.target.value })); markDirtyField(); },
                   })),
                 )
               : null,
@@ -1308,19 +1317,31 @@ function PdfAskBody(props) {
                   h('label', null, h('span', null, '接口地址'), h('input', {
                     value: engineForm.baseURL,
                     placeholder: 'https://api.example.com/v1',
-                    onChange: (event) => setEngineForm((form) => ({ ...form, baseURL: event.target.value })),
+                    onChange: (event) => { setEngineForm((form) => ({ ...form, baseURL: event.target.value })); markDirtyField(); },
                   })),
                   h('label', null, h('span', null, '模型名'), h('input', {
                     value: engineForm.model,
                     placeholder: 'gpt-4o-mini',
-                    onChange: (event) => setEngineForm((form) => ({ ...form, model: event.target.value })),
+                    onChange: (event) => { setEngineForm((form) => ({ ...form, model: event.target.value })); markDirtyField(); },
                   })),
                   h('label', null, h('span', null, 'API key'), h('input', {
                     type: 'password',
                     value: engineForm.apiKey,
                     placeholder: engine.hasKey ? '已保存；留空不修改' : '可留空（本地模型）',
-                    onChange: (event) => setEngineForm((form) => ({ ...form, apiKey: event.target.value })),
+                    onChange: (event) => { setEngineForm((form) => ({ ...form, apiKey: event.target.value })); markDirtyField(); },
                   })),
+                  h('label', null, h('span', null, '启动命令'), h('input', {
+                    value: engineForm.localCommand,
+                    placeholder: 'D:\\Models\\hy-mt\\start-llama.bat',
+                    onChange: (event) => { setEngineForm((form) => ({ ...form, localCommand: event.target.value })); markDirtyField(); },
+                  })),
+                  h('label', { className: 'dpa-check' },
+                    h('input', {
+                      type: 'checkbox',
+                      checked: engineForm.localAutoStart === true,
+                      onChange: (event) => saveEngine({ localAutoStart: event.target.checked }),
+                    }),
+                    '翻译时自动启动本地服务（空闲十分钟后关掉）'),
                 )
               : null,
             h(
@@ -1330,7 +1351,7 @@ function PdfAskBody(props) {
                 type: 'button',
                 className: 'dpa-btn',
                 disabled: engineBusy,
-                onClick: saveEngine,
+                onClick: () => saveEngine(),
               }, engineBusy ? '保存中…' : '保存引擎设置'),
               engine.engine === 'api' && engine.hasKey
                 ? h('button', {
@@ -1343,10 +1364,10 @@ function PdfAskBody(props) {
               engineNote ? h('span', { className: 'dpa-engine-note' }, engineNote) : null,
             ),
             h('div', { className: 'dpa-engine-hint' }, engineForm.engine === 'session'
-              ? '默认：用当前对话实际路由的模型和凭据，不额外配置。'
+              ? '默认：用当前对话实际路由的模型和凭据，不额外配置。三种引擎互斥，只有选中的这一种生效。'
               : engineForm.engine === 'model'
-                ? '仍走宿主的模型服务（凭据、代理都在宿主里），只换 provider/model；名字必须和宿主里已配置的对得上。'
-                : '直连 OpenAI 兼容的 /chat/completions；key 只保存在本机的 dsh-paper-lens.json 里。'),
+                ? '仍走宿主模型服务（凭据、代理都在宿主里），只换 provider/model；三种引擎互斥，只按这一种走。'
+                : '直连 OpenAI 兼容的 /chat/completions；key 只保存在本机的 dsh-paper-lens.json 里。指向 127.0.0.1/localhost 时，填「启动命令」可让插件按需拉起，空闲十分钟后关掉。'),
           ),
           h(
             'div',
@@ -1357,7 +1378,7 @@ function PdfAskBody(props) {
               { className: 'dpa-engine-fields' },
               h('label', null, h('span', null, '语言'), h('select', {
                 value: engineForm.targetLang,
-                onChange: (event) => setEngineForm((form) => ({ ...form, targetLang: event.target.value })),
+                onChange: (event) => saveEngine({ targetLang: event.target.value }),
               }, LANGS.map(([value, label]) => h('option', { key: value, value }, label)))),
             ),
             engineForm.engine !== 'api'
@@ -1368,7 +1389,7 @@ function PdfAskBody(props) {
                     key: value,
                     type: 'button',
                     'aria-pressed': engineForm.reasoning === value ? 'true' : 'false',
-                    onClick: () => setEngineForm((form) => ({ ...form, reasoning: value })),
+                    onClick: () => saveEngine({ reasoning: value }),
                   }, label)),
                 )
               : null,

@@ -5,7 +5,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -46,7 +46,7 @@ function request(handler, body, method = 'POST') {
     writeHead(status, headers) { out.status = status; out.headers = headers; },
     flushHeaders() { out.flushed = true; },
     write(text) { out.chunks.push(text); return true; },
-    end() { out.ended = true; },
+    end(body) { out.ended = true; if (body !== undefined) out.chunks.push(String(body)); },
   };
   return handler(req, res).then(() => out);
 }
@@ -300,6 +300,66 @@ test('a truncated translation keeps the half text, warns, and is never cached', 
     const second = await request(handler, { text: 'Hello.' });
     assert.equal(calls, 2, '半截译文不写缓存，第二次仍然请求模型');
     assert.equal(second.headers['x-dpl-cache'], undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** A harness whose stored translation settings start from `settings`. */
+function harnessWith(settings, llm = llmYielding([])) {
+  const dir = mkdtempSync(join(tmpdir(), 'dpl-route-'));
+  const stateFile = join(dir, 'state.json');
+  writeFileSync(stateFile, JSON.stringify({ citeLinks: {}, translate: settings }), 'utf8');
+  return { handler: harness(llm, stateFile), dir };
+}
+
+const bodyJson = (out) => JSON.parse(out.chunks.join(''));
+
+test('choosing the API engine without an address fails loudly, not by falling back', async () => {
+  const { handler, dir } = harnessWith({ engine: 'api', baseURL: '', model: '' });
+  try {
+    const out = await request(handler, { text: 'Hello.' });
+    assert.equal(out.status, 400);
+    assert.match(bodyJson(out).error, /接口地址/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the API engine needs a model name too', async () => {
+  const { handler, dir } = harnessWith({ engine: 'api', baseURL: 'https://example.test/v1', model: '' });
+  try {
+    const out = await request(handler, { text: 'Hello.' });
+    assert.equal(out.status, 400);
+    assert.match(bodyJson(out).error, /模型名/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the explicit-model engine needs both provider and model', async () => {
+  const { handler, dir } = harnessWith({ engine: 'model', provider: '', model: 'claude-haiku-5-5' });
+  try {
+    const out = await request(handler, { text: 'Hello.' });
+    assert.equal(out.status, 400);
+    assert.match(bodyJson(out).error, /provider/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a local API that is down says how to start it, instead of "fetch failed"', async () => {
+  const { handler, dir } = harnessWith({
+    engine: 'api',
+    baseURL: 'http://127.0.0.1:9/v1',
+    model: 'hy-mt',
+    localCommand: '',
+    localAutoStart: false,
+  });
+  try {
+    const out = await request(handler, { text: 'Hello.' });
+    assert.equal(out.status, 502);
+    assert.match(bodyJson(out).error, /本地/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

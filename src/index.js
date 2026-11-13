@@ -20,6 +20,7 @@ import { dirname, join } from 'node:path';
 
 import { addMark, MARK_COLORS, pdfExists, readMarks, removeMark, resolvePdfPath, updateMarkNote } from './marks.js';
 import { translateViaApi } from './api.js';
+import { createLocalRunner, isLocalBaseURL } from './local.js';
 import { promptsForConfig } from './prompts.js';
 
 export const name = 'dsh-paper-lens';
@@ -130,6 +131,9 @@ export function normalizeTranslateSettings(raw) {
     apiKey: typeof src.apiKey === 'string' ? src.apiKey : '',
     targetLang: normalizeTargetLang(src.targetLang),
     reasoning: REASONING_LEVELS.includes(src.reasoning) ? src.reasoning : 'auto',
+    // A local server the plugin may start when the API engine points at this machine.
+    localCommand: text(src.localCommand),
+    localAutoStart: src.localAutoStart === true,
   };
 }
 
@@ -144,6 +148,8 @@ export function publicTranslateSettings(settings) {
     hasKey: Boolean(safe.apiKey),
     targetLang: safe.targetLang,
     reasoning: safe.reasoning,
+    localCommand: safe.localCommand,
+    localAutoStart: safe.localAutoStart,
   };
 }
 
@@ -432,6 +438,9 @@ export function apply(ctx, config = {}) {
   const agentBySession = new Map();
   /** provider/model + 原文 -> 译文；短时间重复划同一段不再等模型。 */
   const translateCache = new Map();
+  /** 本地翻译服务：按需启动，空闲十分钟后关掉。 */
+  const localRunner = createLocalRunner();
+  ctx.on?.('dispose', () => localRunner.stop());
   const added = new WeakSet();
 
   const sessionIdOf = (agent) => String(agent?.session?.id ?? '');
@@ -609,6 +618,14 @@ export function apply(ctx, config = {}) {
         if (typeof body.apiKey !== 'string') return sendJson(res, 400, { error: 'apiKey 必须是字符串' });
         patch.apiKey = body.apiKey;
       }
+      if ('localCommand' in body) {
+        if (typeof body.localCommand !== 'string') return sendJson(res, 400, { error: 'localCommand 必须是字符串' });
+        patch.localCommand = body.localCommand;
+      }
+      if ('localAutoStart' in body) {
+        if (typeof body.localAutoStart !== 'boolean') return sendJson(res, 400, { error: 'localAutoStart 必须是布尔值' });
+        patch.localAutoStart = body.localAutoStart;
+      }
       if ('targetLang' in body) {
         if (!TARGET_LANGS.some(([code]) => code === body.targetLang)) return sendJson(res, 400, { error: 'targetLang 不在支持列表里' });
         patch.targetLang = body.targetLang;
@@ -726,12 +743,20 @@ export function apply(ctx, config = {}) {
       const targetLang = normalizeTargetLang(settings.targetLang);
       // 「自动」沿用插件配置；其余档位由用户在设置里显式选择。
       const reasoningEffort = settings.reasoning === 'auto' ? config.translateReasoning : settings.reasoning;
-      // 「自定义 API」是显式选择：不走宿主 llm，也不需要会话凭据。
-      const usingApi = settings.engine === 'api' && Boolean(settings.baseURL && settings.model);
+      // 三种引擎互斥：只按当前选中的一种走。字段没填完就明确报错，
+      // 不再悄悄回落到会话模型——那会让「我明明选了本地，怎么走云端」变得无法解释。
+      if (settings.engine === 'api') {
+        if (!/^https?:\/\//i.test(settings.baseURL)) return sendJson(res, 400, { error: '「自定义 API」还没填接口地址（http:// 或 https://）' });
+        if (!settings.model) return sendJson(res, 400, { error: '「自定义 API」还没填模型名' });
+      }
+      if (settings.engine === 'model' && (!settings.provider || !settings.model)) {
+        return sendJson(res, 400, { error: '「指定模型」需要同时填 provider 和 model' });
+      }
+      const usingApi = settings.engine === 'api';
       const llm = scope.llm;
       if (!usingApi && typeof llm?.stream !== 'function') return sendJson(res, 503, { error: '模型服务不可用' });
       let selection = null;
-      if (settings.engine === 'model' && settings.provider && settings.model) {
+      if (settings.engine === 'model') {
         // 显式指定模型：仍然走宿主 llm（因此凭证/代理/审计都在宿主里），只是换 provider/model。
         selection = { provider: settings.provider, model: settings.model };
       } else if (!usingApi) {
@@ -744,6 +769,19 @@ export function apply(ctx, config = {}) {
         selection ??= pickSelection(scope, config);
         if (!selection) {
           return sendJson(res, 503, { error: '没有可用的默认模型：请先在设置里选一个，或在插件配置里写 provider/model' });
+        }
+      }
+      // 自定义 API 指向本机时，允许插件替用户把服务拉起来（命令是用户自己填的）。
+      if (usingApi && isLocalBaseURL(settings.baseURL)) {
+        const local = await localRunner.ensure({
+          baseURL: settings.baseURL,
+          command: settings.localCommand,
+          autoStart: settings.localAutoStart,
+        });
+        if (!local.ready) {
+          return sendJson(res, 502, {
+            error: `${local.reason ?? '本地翻译服务没有就绪'}。在 设置 → 翻译引擎 → 自定义 API 里填「本地服务启动命令」并勾选「翻译时自动启动」，或者先手动启动它。`,
+          });
         }
       }
       const identity = usingApi ? { provider: `api:${settings.baseURL}`, model: settings.model } : selection;
