@@ -277,6 +277,35 @@ test('paragraphs are translated in parallel and emitted in reading order', async
   }
 });
 
+test('a long single paragraph is split at sentences and streamed in order', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dpl-route-'));
+  try {
+    const calls = [];
+    const handler = harness({
+      stream(options) {
+        const prompt = options.messages[0].content[0].text;
+        const which = prompt.includes('AAAA') ? '甲' : '乙';
+        calls.push(which);
+        return (async function* () {
+          yield { type: 'text-delta', index: 0, text: which };
+          yield { type: 'finish', reason: 'stop' };
+        })();
+      },
+    }, join(dir, 'state.json'));
+
+    const text = `${'A'.repeat(300)}. ${'B'.repeat(300)}.`;
+    const out = await request(handler, { text });
+    assert.equal(calls.length, 2, '单段长文应按句切成两片并行');
+    assert.deepEqual(lines(out), [{ delta: '甲' }, { delta: '乙' }, { done: true }]);
+
+    const again = await request(handler, { text });
+    assert.equal(again.headers['x-dpl-cache'], 'hit');
+    assert.deepEqual(lines(again), [{ delta: '甲乙' }, { done: true }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a truncated translation keeps the half text, warns, and is never cached', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dpl-route-'));
   try {
