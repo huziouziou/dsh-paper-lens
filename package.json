@@ -12,8 +12,7 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "src/index.js",
-    "src/api.js",
+    "src/*.js",
     "lib",
     "cordis.patch.yml",
     "package.json",
