@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Paper Lens",
+    "description": "Open a paper in the right sidebar and select text to translate, quote or annotate — no window switching. Handles cross-page selections, strips running headers, and can drive a local translation model on demand.",
+    "detail": "detail/DETAIL.md"
+  }
+}
