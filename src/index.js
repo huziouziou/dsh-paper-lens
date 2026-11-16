@@ -287,6 +287,37 @@ export function pickSelection(scope, config = {}) {
 }
 
 /**
+ * 界面上「当前生效」那一行：这一次翻译实际会走哪条路。
+ *
+ * 三种引擎互斥，所以这里只按选中的那一种报；`session` 要问宿主当前会话的
+ * 默认模型，问不到就如实说不知道，而不是假装跟随成功。
+ */
+export function describeTranslateRoute(scope, settings) {
+  const engine = settings.engine;
+  if (engine === 'model') {
+    return {
+      engine,
+      provider: settings.provider,
+      model: settings.model,
+      label: `${settings.provider} / ${settings.model}`,
+    };
+  }
+  if (engine === 'api') {
+    const local = isLocalBaseURL(settings.baseURL);
+    const where = settings.baseURL || '（还没填接口地址）';
+    const model = settings.model || '（还没填模型名）';
+    return { engine, baseURL: settings.baseURL, model: settings.model, local, label: `${model} @ ${where}${local ? '（本地）' : ''}` };
+  }
+  const selection = pickSelection(scope);
+  return {
+    engine: 'session',
+    provider: selection?.provider ?? '',
+    model: selection?.model ?? '',
+    label: selection ? `${selection.provider} / ${selection.model}` : '跟随会话（当前会话还没有模型）',
+  };
+}
+
+/**
  * 跑一次翻译，边收边通过 `onDelta` 推出去；返回汇总。
  *
  * 界面是流式的（边出边看），所以正常路径下 `out` 只是给调用方核对用的；
@@ -594,10 +625,12 @@ export function apply(ctx, config = {}) {
     handler: async (req = {}, res) => {
       const method = (req.method || 'GET').toUpperCase();
       if (method === 'GET') {
+        const settings = modes.translate();
         return sendJson(res, 200, {
           prompts: promptsForConfig(config),
           markColors: MARK_COLORS,
-          translate: publicTranslateSettings(modes.translate()),
+          translate: publicTranslateSettings(settings),
+          resolved: describeTranslateRoute(ctx, settings),
         });
       }
       if (method !== 'POST') return sendJson(res, 405, { error: '只支持 GET/POST' });
@@ -643,7 +676,7 @@ export function apply(ctx, config = {}) {
         if (!merged.model) return sendJson(res, 400, { error: '自定义 API 需要模型名' });
       }
       const saved = modes.saveTranslate(merged);
-      return sendJson(res, 200, { translate: publicTranslateSettings(saved) });
+      return sendJson(res, 200, { translate: publicTranslateSettings(saved), resolved: describeTranslateRoute(ctx, saved) });
     },
   });
 

@@ -87,6 +87,24 @@ test('a server that never answers is reported, not waited on forever', async () 
   assert.match(result.reason, /没有响应/);
 });
 
+test('the model is started without a console window of its own', async () => {
+  const seen = [];
+  const runner = createLocalRunner({
+    pollMs: 1,
+    readyMs: 30,
+    fetchImpl: async () => ({ ok: false }),
+    spawnImpl: (...args) => { seen.push(args); return fakeChild(); },
+  });
+  await runner.ensure({ baseURL: 'http://127.0.0.1:8080/v1', command: 'start.bat', autoStart: true });
+  const options = seen[0][1];
+  assert.equal(options.shell, true);
+  assert.equal(options.windowsHide, true);
+  // detached:true hands the child its own console — a black window pops up every
+  // time the local model starts.
+  assert.notEqual(options.detached, true);
+  runner.stop();
+});
+
 test('stop kills the whole process tree on Windows, or signals it elsewhere', async () => {
   const calls = [];
   const runner = createLocalRunner({

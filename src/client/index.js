@@ -172,6 +172,7 @@ const CSS = [
   '.dpa-engine-actions{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap}',
   '.dpa-engine-note{font-size:11px;opacity:.8}',
   '.dpa-engine-hint{font-size:11px;opacity:.65;margin-top:6px;line-height:1.5}',
+  '.dpa-resolved{font-size:11px;opacity:.85;margin:-2px 0 6px;line-height:1.5;word-break:break-word}',
   '.dpa-check{display:flex;align-items:center;gap:6px;font-size:12px;opacity:.9;margin-top:2px}',
   '.dpa-check input{flex:none;margin:0}',
   '.dpa-mark-detail{position:fixed;z-index:1004;width:300px;max-width:calc(100vw - 24px);padding:9px 11px;border-radius:9px;background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#1f2937);border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.14));box-shadow:0 10px 30px rgba(0,0,0,.3);font:12px/1.55 system-ui,sans-serif}',
@@ -366,6 +367,8 @@ function PdfAskBody(props) {
   const [engineForm, setEngineForm] = useState(DEFAULT_ENGINE_FORM);
   const [engineBusy, setEngineBusy] = useState(false);
   const [engineNote, setEngineNote] = useState('');
+  /** 这次翻译实际会用哪个 provider/model（服务端算好给界面看）。 */
+  const [resolved, setResolved] = useState(null);
   const longPress = useRef(null);
   const longFired = useRef(false);
 
@@ -391,6 +394,7 @@ function PdfAskBody(props) {
           setEngine(data.translate);
           setEngineForm({ ...data.translate, apiKey: '' });
         }
+        setResolved(data?.resolved ?? null);
       })
       .catch(() => { /* built-in presets */ });
     return () => { cancelled = true; };
@@ -922,6 +926,7 @@ function PdfAskBody(props) {
         return;
       }
       setEngine(data.translate);
+      setResolved(data.resolved ?? null);
       // 全量保存后以服务端为准；离散改动则保留正在编辑的文本框内容。
       if (!isPatch) setEngineForm({ ...data.translate, apiKey: '' });
       setEngineNote('已保存');
@@ -941,6 +946,7 @@ function PdfAskBody(props) {
       if (!response.ok || !data?.translate) return;
       setEngine(data.translate);
       setEngineForm({ ...data.translate, apiKey: '' });
+      setResolved(data.resolved ?? null);
     } catch { /* 拉不到就用手里的旧值 */ }
   };
 
@@ -961,6 +967,7 @@ function PdfAskBody(props) {
       }
       setEngine(data.translate);
       setEngineForm({ ...data.translate, apiKey: '' });
+      setResolved(data.resolved ?? null);
       setEngineNote('key 已清除');
     } catch (error) {
       setEngineNote(`清除失败：${error?.message ?? error}`);
@@ -1320,6 +1327,9 @@ function PdfAskBody(props) {
             'div',
             { className: 'dpa-engine' },
             h('div', { className: 'dpa-engine-head' }, '翻译引擎'),
+            resolved
+              ? h('div', { className: 'dpa-resolved' }, `当前生效：${resolved.label}`)
+              : null,
             h(
               'div',
               { className: 'dpa-theme-row', role: 'group', 'aria-label': '翻译引擎' },

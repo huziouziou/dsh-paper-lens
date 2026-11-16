@@ -73,7 +73,11 @@ export function createLocalRunner(env = {}) {
     pending = (async () => {
       lastError = null;
       try {
-        child = spawnImpl(command, { shell: true, detached: true, stdio: 'ignore', windowsHide: true });
+        // Not `detached: true`: on Windows that gives the child its own console,
+        // and cmd.exe / the model server then pops a black window on screen every
+        // time the model is started. With windowsHide the console stays hidden;
+        // the process tree is still ours to kill (stop() uses taskkill /T).
+        child = spawnImpl(command, { shell: true, stdio: 'ignore', windowsHide: true });
         child?.once?.('error', (error) => { lastError = error?.message ?? String(error); });
         child?.unref?.();
       } catch (error) {

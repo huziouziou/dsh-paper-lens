@@ -29,15 +29,15 @@ function sse(lines, { ok = true, status = 200 } = {}) {
   };
 }
 
-function harness(stateFile) {
+function harness(stateFile, { defaultModel } = {}) {
   const routes = {};
   const ctx = {
     on: () => {},
     logger: {},
-    get: () => undefined,
+    get: (id) => (id === 'agentDefaultModel' && defaultModel ? { currentSelection: () => defaultModel } : undefined),
     inject: (_names, fn) => fn({
       effect: (f) => f(),
-      get: () => undefined,
+      get: (id) => (id === 'agentDefaultModel' && defaultModel ? { currentSelection: () => defaultModel } : undefined),
       webServer: { register: (r) => { routes[r.path] = r.handler; return () => {}; } },
       commands: { register: () => () => {} },
       llm: { stream: async function* () { yield { type: 'finish', reason: 'stop' }; } },
@@ -232,4 +232,37 @@ test('a gateway that ignores stream:true is read as one JSON answer', async () =
     }),
   });
   assert.equal(result.translation, '你好。');
+});
+
+test('the settings panel is told which model would actually be used', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dpl-resolved-'));
+  try {
+    const routes = harness(join(dir, 'state.json'), {
+      defaultModel: { provider: 'opencode-go', model: 'deepseek-v4.1-flash' },
+    });
+    const config = routes[`${BASE}/config`];
+
+    const following = await call(config);
+    assert.deepEqual(following.json.resolved, {
+      engine: 'session',
+      provider: 'opencode-go',
+      model: 'deepseek-v4.1-flash',
+      label: 'opencode-go / deepseek-v4.1-flash',
+    });
+
+    const pinned = await call(config, {
+      method: 'POST',
+      body: { engine: 'model', provider: 'opencode-go', model: 'claude-haiku-5-5' },
+    });
+    assert.equal(pinned.json.resolved.label, 'opencode-go / claude-haiku-5-5');
+
+    const local = await call(config, {
+      method: 'POST',
+      body: { engine: 'api', model: 'hy-mt', baseURL: 'http://127.0.0.1:8080/v1' },
+    });
+    assert.equal(local.json.resolved.local, true);
+    assert.equal(local.json.resolved.label, 'hy-mt @ http://127.0.0.1:8080/v1（本地）');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
