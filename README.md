@@ -2,7 +2,7 @@
 
 在 DSH 里读论文：右侧边栏打开 PDF，划词就能翻译、引用、批注——不用切窗口，不用复制粘贴到别处。
 
-A PDF reading plugin for [DeepSeek Harness](https://github.com/deepseek-ai): open a paper in the right sidebar, select text to translate, quote it into the chat, or annotate it.
+A PDF reading plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): open a paper in the right sidebar, select text to translate, quote it into the chat, or annotate it.
 
 ![Paper Lens 的右侧边栏：页码、缩放、划词工具条与论文页面](screenshots/paper-lens-sidebar.png)
 
@@ -18,13 +18,13 @@ A PDF reading plugin for [DeepSeek Harness](https://github.com/deepseek-ai): ope
 
 **本地目录（开发或自用）**：在 DSH 里打开 **设置 → 插件 → 添加插件**，填仓库目录的完整路径（`package.json` 所在目录，不是 `lib/client.js`）。改完代码后需要重启 DSH，客户端改动还要重新构建（`npm run build`）。
 
-**从 npm 安装（发布后）**：
+**从 npm 安装**：桌面端在 **添加插件** 对话框里输入包名 `dsh-paper-lens`；Web 端用命令行：
 
 ```powershell
-dsh plugin --profile desktop add dsh-paper-lens
+dsh plugin --profile web add dsh-paper-lens
 ```
 
-然后重启 DSH。服务端代码在宿主进程里加载，改完必须重启才能生效。
+装完重启 DSH。`desktop` profile 由桌面应用自己管理，不要用 `dsh plugin --profile desktop`——DSH 0.2.1-rc.5 起这条命令会被拒绝。服务端代码在宿主进程里加载，改完必须重启才能生效。
 
 ## 翻译引擎
 
@@ -76,4 +76,4 @@ npm test           # 116 个用例，必须全过
 
 ## 许可
 
-MIT。改造自 [dsh-cite-lens 0.3.1](https://github.com/adithyanraj/dsh-cite-lens)（MIT，作者 Adithya N Raj）：引用链接与 PDF 预览的骨架来自它，翻译、批注、语言与引擎设置是后加的。
+MIT。改造自 [dsh-cite-lens 0.3.1](https://github.com/adithyanraj03/dsh-cite-lens)（MIT，作者 Adithya N Raj）：引用链接与 PDF 预览的骨架来自它，翻译、批注、语言与引擎设置是后加的。源码与问题反馈：[github.com/huziouziou/dsh-paper-lens](https://github.com/huziouziou/dsh-paper-lens)。

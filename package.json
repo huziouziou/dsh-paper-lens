@@ -66,6 +66,14 @@
   ],
   "author": "Paper Lens contributors (fork of dsh-cite-lens 0.3.1 by Adithya N Raj)",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huziouziou/dsh-paper-lens.git"
+  },
+  "homepage": "https://github.com/huziouziou/dsh-paper-lens#readme",
+  "bugs": {
+    "url": "https://github.com/huziouziou/dsh-paper-lens/issues"
+  },
   "devDependencies": {
     "esbuild": "^0.28.2",
     "pdfjs-dist": "^6.4.299"
