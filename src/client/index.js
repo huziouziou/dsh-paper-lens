@@ -405,19 +405,35 @@ function PdfAskBody(props) {
     const scrolls = outer && /(auto|scroll)/.test(getComputedStyle(outer).overflowY);
     rootRef.current.classList.toggle('dpa-own-scroll', !scrolls);
     const scroller = scrolls ? outer : rootRef.current;
+    let anchorTimer = 0;
+    let lastAnchor = null;
+    const flushAnchor = () => {
+      if (!lastAnchor) return;
+      memory.set(address, lastAnchor);
+      lastAnchor = null;
+    };
     const view = new PdfView(pagesRef.current, scroller, {
       onPage: (n) => {
         setPage(n);
         setPageInput(String(n));
-        memory.set(address, { page: n });
+      },
+      // The exact position, not just the page: reading often stops between two
+      // pages, and remembering only "page 3" would reopen at the top of page 3.
+      // Debounced while scrolling, flushed on close so a quick tab switch keeps
+      // the last line.
+      onPosition: (anchor) => {
+        if (!anchor) return;
+        lastAnchor = anchor;
+        clearTimeout(anchorTimer);
+        anchorTimer = setTimeout(flushAnchor, 120);
       },
     });
     viewRef.current = view;
     let cancelled = false;
     let unregister = () => {};
-    // Read the saved page BEFORE opening: build() used to report page 1, which
-    // overwrote this value in the same tick, so every re-open went back to 1.
-    const remembered = memory.get(address)?.page;
+    // Read the saved position BEFORE opening: build() reports page 1, which
+    // used to overwrite this value in the same tick, so every re-open went to 1.
+    const remembered = memory.get(address);
     setStatus({ phase: 'loading' });
     view.open(bytes).then(() => {
       if (cancelled) return;
@@ -438,6 +454,8 @@ function PdfAskBody(props) {
     });
     return () => {
       cancelled = true;
+      clearTimeout(anchorTimer);
+      flushAnchor();
       unregister();
       view.dispose();
       viewRef.current = null;

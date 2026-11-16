@@ -14,6 +14,7 @@ import * as pdfjs from 'pdfjs-dist';
 import { attachSelectionFix } from './selection.js';
 import { findInItems, boxesFor, searchOrder } from './textsearch.js';
 import { isMarginFurniture } from './margins.js';
+import { anchorFrom, normalizeAnchor, topForAnchor } from './anchor.js';
 
 let sharedWorker; // undefined: not made yet; null: none (tests)
 
@@ -62,14 +63,17 @@ export class PdfView {
    * @param container where the pages are stacked (owned by this view)
    * @param scroller  the element that scrolls — the container's own root, or the Files tab's scroll area
    * @param opts.onPage called with the page most in view
+   * @param opts.onPosition called with the exact scroll position ({ page, offset }) as it moves
    */
-  constructor(container, scroller, { onPage } = {}) {
+  constructor(container, scroller, { onPage, onPosition } = {}) {
     ensureWorker();
     this.container = container;
     this.scroller = scroller;
     this.onPage = onPage;
+    this.onPosition = onPosition;
     this.pages = [];
     this.tops = [];
+    this.heights = [];
     this.doc = null;
     this.zoom = 'fit';
     this.scale = 1;
@@ -82,13 +86,13 @@ export class PdfView {
     this.settleTimer = null;
     this.marks = [];
     this.onMarkClick = null;
-    this.pendingPage = 0;
+    this.pendingAnchor = null;
 
     this.resizeObserver = new ResizeObserver(() => {
       // A tab that was hidden while the PDF opened has no height yet: the saved
-      // page can only be applied once it is laid out (scrollTop on a hidden
+      // position can only be applied once it is laid out (scrollTop on a hidden
       // element stays 0).
-      if (this.pendingPage) this.applyPendingPage();
+      if (this.pendingAnchor) this.applyPendingPage();
       if (this.zoom === 'fit') this.relayout();
     });
     this.resizeObserver.observe(container);
@@ -165,27 +169,45 @@ export class PdfView {
   }
 
   /**
-   * Put the reader back on a saved page, once the scroller has a real height.
-   * Setting scrollTop on a hidden tab does nothing, so keep the number pending
-   * and let the ResizeObserver retry when the tab is shown.
+   * Put the reader back exactly where it was, once the scroller has a real
+   * height. Accepts what earlier versions saved (a bare page number) as well as
+   * the current `{ page, offset }` form. Setting scrollTop on a hidden tab does
+   * nothing, so keep the position pending and let the ResizeObserver retry when
+   * the tab is shown.
    */
-  restorePage(n) {
-    const page = Math.max(1, Math.min(Math.floor(Number(n) || 1), this.pages.length || 1));
-    if (page <= 1) return false;
-    this.pendingPage = page;
+  restorePage(remembered) {
+    const anchor = normalizeAnchor(remembered);
+    if (!anchor || !this.pages.length) return false;
+    anchor.page = Math.max(1, Math.min(Math.floor(anchor.page), this.pages.length));
+    // A fresh document sits above page 1 (negative offset): nothing to restore.
+    if (anchor.page <= 1 && anchor.offset <= 0.001) return false;
+    this.pendingAnchor = anchor;
     return this.applyPendingPage();
   }
 
   applyPendingPage() {
-    const page = this.pendingPage;
-    if (!page || this.disposed || !this.pages.length) return false;
+    const anchor = this.pendingAnchor;
+    if (!anchor || this.disposed || !this.pages.length) return false;
     if (this.scroller.clientHeight === 0) return false;
-    this.pendingPage = 0;
-    this.scrollToPage(page, 0, false);
-    // Set currentPage too: loadSizes() calls applySizes(true), which keeps the
-    // place of `currentPage` — left at 1 it would scroll the reader back.
-    this.trackPage();
-    this.schedule();
+    this.pendingAnchor = null;
+    return this.scrollToAnchor(anchor);
+  }
+
+  /** Where the reader is now: the page under the viewport's top edge, plus how far into it. */
+  anchorState() {
+    if (!this.pages.length) return null;
+    return anchorFrom(this.scroller.scrollTop - (this.containerOffset ?? 0), this.tops, this.heights);
+  }
+
+  /** Scroll so the viewport's top edge sits back on a saved `{ page, offset }`. */
+  scrollToAnchor(anchor, track = true) {
+    if (!anchor || !this.pages.length) return false;
+    const top = topForAnchor(anchor, this.tops, this.heights);
+    this.scroller.scrollTop = Math.max(0, (this.containerOffset ?? 0) + top);
+    if (track) {
+      this.trackPage();
+      this.schedule();
+    }
     return true;
   }
 
@@ -206,11 +228,13 @@ export class PdfView {
 
   /** Size every page box for the current scale and recompute their positions. */
   applySizes(keepPosition = false) {
-    const anchor = this.currentPage;
-    const within = keepPosition ? this.offsetWithin(anchor) : 0;
+    // Read the position before the sizes change: it is a fraction of the page
+    // height, so it survives a resize while an absolute scrollTop would not.
+    const saved = keepPosition ? this.anchorState() : null;
     const s = this.scale;
     let top = PAD_TOP;
     this.tops = [];
+    this.heights = [];
     for (const page of this.pages) {
       const w = Math.floor(page.size.width * s);
       const h = Math.floor(page.size.height * s);
@@ -223,21 +247,16 @@ export class PdfView {
       style.setProperty('--scale-round-y', '1px');
       page.h = h;
       this.tops.push(top);
+      this.heights.push(h);
       top += h + GAP;
     }
     this.containerOffset = this.container.getBoundingClientRect().top - this.scroller.getBoundingClientRect().top + this.scroller.scrollTop;
-    if (keepPosition) this.scrollToPage(anchor, within, false);
+    if (saved) this.scrollToAnchor(saved, false);
   }
 
   /** A page's top in the scroller's coordinates. */
   topOf(n) {
     return (this.containerOffset ?? 0) + (this.tops[n - 1] ?? 0);
-  }
-
-  offsetWithin(n) {
-    const page = this.pages[n - 1];
-    if (!page) return 0;
-    return (this.scroller.scrollTop - this.topOf(n)) / Math.max(1, page.h);
   }
 
   scrollToPage(n, within = 0, track = true) {
@@ -267,6 +286,9 @@ export class PdfView {
       this.currentPage = found;
       this.onPage?.(found);
     }
+    // The exact position, not just the page: a tab reopened mid-page (or across
+    // a page break) has to land on the same line the reader was looking at.
+    if (this.onPosition) this.onPosition(this.anchorState());
   }
 
   /** Pages currently on screen. */
