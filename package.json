@@ -23,6 +23,7 @@
     "LICENSE",
     "dsh.plugin.json",
     "screenshots.json",
+    "screenshots",
     "assets/icon.png",
     "detail",
     "locale"
