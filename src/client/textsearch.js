@@ -86,6 +86,26 @@ export function foldQuery(query, loose = false) {
   return loose ? folded.replace(/[^\p{L}\p{N}]/gu, '') : folded;
 }
 
+/** Spans (item + character range) behind one match of the normalized page text. */
+function spansForMatch(page, from, to, items) {
+  const spans = new Map();
+  for (let k = from; k < to; k += 1) {
+    const item = page.src[k * 2];
+    const offset = page.src[k * 2 + 1];
+    const span = spans.get(item);
+    if (span) {
+      span.from = Math.min(span.from, offset);
+      span.to = Math.max(span.to, offset + 1);
+    } else {
+      spans.set(item, { item, from: offset, to: offset + 1 });
+    }
+  }
+  return [...spans.values()]
+    .map((s) => ({ ...s, to: Math.min(s.to, (items[s.item].str ?? '').length) }))
+    .filter((s) => s.to > s.from)
+    .sort((a, b) => a.item - b.item);
+}
+
 /**
  * Find a quote in one page's text items.
  * @returns per-item character spans [{ item, from, to }], or null
@@ -97,24 +117,41 @@ export function findInItems(items, query) {
     const page = indexPage(items, loose);
     const at = page.text.indexOf(q);
     if (at < 0) continue;
-    const spans = new Map();
-    for (let k = at; k < at + q.length; k += 1) {
-      const item = page.src[k * 2];
-      const offset = page.src[k * 2 + 1];
-      const span = spans.get(item);
-      if (span) {
-        span.from = Math.min(span.from, offset);
-        span.to = Math.max(span.to, offset + 1);
-      } else {
-        spans.set(item, { item, from: offset, to: offset + 1 });
-      }
-    }
-    return [...spans.values()]
-      .map((s) => ({ ...s, to: Math.min(s.to, (items[s.item].str ?? '').length) }))
-      .filter((s) => s.to > s.from)
-      .sort((a, b) => a.item - b.item);
+    return spansForMatch(page, at, at + q.length, items);
   }
   return null;
+}
+
+/**
+ * Every occurrence of a query on one page, in reading order. Same folding as
+ * findInItems, but short queries (2+ characters) are allowed: this backs the
+ * reader's own find box, not citation matching.
+ * @returns per-match span lists, at most `limit`
+ */
+export function findAllInItems(items, query, limit = 200) {
+  for (const loose of [false, true]) {
+    const q = foldQuery(query, loose);
+    if (q.length < (loose ? 4 : 2)) continue;
+    const page = indexPage(items, loose);
+    const hits = [];
+    let at = 0;
+    while (hits.length < limit) {
+      const found = page.text.indexOf(q, at);
+      if (found < 0) break;
+      const spans = spansForMatch(page, found, found + q.length, items);
+      if (spans.length) hits.push(spans);
+      at = found + Math.max(1, q.length);
+    }
+    if (hits.length) return hits;
+  }
+  return [];
+}
+
+/** Next/previous index through `total` hits, wrapping around (-1 = none yet). */
+export function stepHit(current, delta, total) {
+  if (total <= 0) return -1;
+  if (current < 0 || current >= total) return delta > 0 ? 0 : total - 1;
+  return ((current + delta) % total + total) % total;
 }
 
 /**

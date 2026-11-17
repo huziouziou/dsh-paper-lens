@@ -12,7 +12,7 @@
 
 import * as pdfjs from 'pdfjs-dist';
 import { attachSelectionFix } from './selection.js';
-import { findInItems, boxesFor, searchOrder } from './textsearch.js';
+import { findInItems, findAllInItems, boxesFor, searchOrder } from './textsearch.js';
 import { isMarginFurniture } from './margins.js';
 import { anchorFrom, normalizeAnchor, topForAnchor } from './anchor.js';
 
@@ -530,8 +530,62 @@ export class PdfView {
   }
 
   /**
+   * Every occurrence of a query in the document, in page order. Reads pdf.js
+   * text content directly, so pages that were never drawn are searched too.
+   * @returns {{ page: number, boxes: object[] }[]}
+   */
+  async findText(query, limit = 300) {
+    if (!this.doc || !String(query ?? '').trim()) return [];
+    this.textCache ??= new Map();
+    const hits = [];
+    for (let n = 1; n <= this.doc.numPages && hits.length < limit; n += 1) {
+      if (this.disposed) return hits;
+      let entry = this.textCache.get(n);
+      if (!entry) {
+        const page = await this.doc.getPage(n);
+        const { items } = await page.getTextContent();
+        entry = { items, viewport: page.getViewport({ scale: 1 }) };
+        this.textCache.set(n, entry);
+      }
+      for (const spans of findAllInItems(entry.items, query, limit - hits.length)) {
+        const boxes = boxesFor(spans, entry.items, entry.viewport);
+        if (boxes.length) hits.push({ page: n, boxes });
+      }
+    }
+    return hits;
+  }
+
+  /** Scroll to a find hit and keep it highlighted until the next one or a clear. */
+  showHit(pageNo, boxes = []) {
+    const page = this.pages[pageNo - 1];
+    if (!page) return;
+    this.clearFind();
+    if (boxes.length) {
+      const top = Math.min(...boxes.map((b) => b.y));
+      this.scroller.scrollTop = Math.max(0, this.topOf(pageNo) + top * page.h - this.scroller.clientHeight * 0.35);
+      this.trackPage();
+      this.schedule();
+    } else {
+      this.scrollToPage(pageNo);
+    }
+    for (const box of boxes) {
+      const hit = document.createElement('div');
+      hit.className = 'dpa-find';
+      hit.style.left = `${box.x * 100}%`;
+      hit.style.top = `${box.y * 100}%`;
+      hit.style.width = `${box.w * 100}%`;
+      hit.style.height = `${box.h * 100}%`;
+      page.el.appendChild(hit);
+    }
+  }
+
+  /** Drop the find highlight (the box was cleared or another file opened). */
+  clearFind() {
+    for (const page of this.pages) page.el.querySelectorAll('.dpa-find').forEach((el) => el.remove());
+  }
+
+  /**
    * Draw stored annotations on their pages.
-   *
    * They are page-relative percentages, so zooming and re-rendering the page
    * text never needs to move them. The translucent bands are pointer-events:none
    * (text selection still works through them); a small numbered badge at the

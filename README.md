@@ -7,6 +7,7 @@ A PDF reading plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deeps
 ![Paper Lens 的右侧边栏：页码、缩放、划词工具条与论文页面](screenshots/paper-lens-sidebar.png)
 
 - **右侧边栏读 PDF**：pdf.js 渲染，缩放 / 适宽 / 页码跳转，跨页连续滚动。切走再切回，停在你离开的那一行（不是页首）。
+- **页内查找**：顶栏输入两个字以上即查整份论文，回车或 ↑↓ 逐处跳、显示 `n/total`，命中处黄色高亮；放大后横向拖动条能滚到页面左缘。
 - **划词翻译**：只出译文，流式显示；长段落自动并行，译文按模型与原文缓存在本机。
 - **划词引用**：把选中段落带页码写进对话（`p.2–3` 这种跨页范围也对），页眉、版权横幅、页码标签会被剔掉。
 - **批注**：四种颜色高亮，可写文字、可拖动、在边栏里统一查看与定位；批注和 PDF 放在一起，跟着文件走。
@@ -61,7 +62,7 @@ llama-server -m Hy-MT2-1.8B-Q4_K_M.gguf --host 127.0.0.1 --port 8080 -c 8192 -t 
 cd dsh-paper-lens
 npm install
 npm run build      # 客户端 bundle → lib/client.js
-npm test           # 116 个用例，必须全过
+npm test           # 124 个用例，必须全过
 ```
 
 - 服务端 `src/index.js`（路由、翻译、批注、配置），客户端 `src/client/*`（阅读器、选区、译文气泡、设置面板）。

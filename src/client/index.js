@@ -17,6 +17,7 @@ import { DEFAULT_PROMPTS } from '../prompts.js';
 import { DEFAULT_PREFS, FONT_RANGE, THEMES, WIDTH_RANGE, loadPrefs, savePrefs } from './prefs.js';
 import { MARK_COLORS, deleteMark, loadMarks, markFromSelection, saveMark, updateMarkNote } from './marks.js';
 import { copyText } from './clipboard.js';
+import { stepHit } from './textsearch.js';
 
 const h = React.createElement;
 const { useEffect, useRef, useState, useCallback } = React;
@@ -89,8 +90,13 @@ const CSS = [
   '.dpa-theme-row{display:flex;gap:6px;margin:2px 0 10px}',
   '.dpa-theme-row button{flex:1;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));background:transparent;color:inherit;border-radius:6px;padding:4px 6px;font:inherit;font-size:11px;cursor:pointer}',
   '.dpa-theme-row button[aria-pressed=true]{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.18));font-weight:600}',
-  '.dpa-pages{display:flex;flex-direction:column;align-items:center;gap:14px;padding:16px 16px 40px}',
-  '.dpa-page{position:relative;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.35);flex:none;cursor:text;contain:layout paint}',
+  // Pages are centred with `margin:auto` rather than `align-items:center`: a
+  // zoomed page is wider than the pane, and centred flex overflow spills equally
+  // to both sides — the left half then sits at a negative offset that scrollLeft
+  // can never reach. Auto margins collapse to 0 when there is no room, so the
+  // left edge stays at the padding and the whole page scrolls into view.
+  '.dpa-pages{display:flex;flex-direction:column;gap:14px;padding:16px 16px 40px}',
+  '.dpa-page{position:relative;margin-inline:auto;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.35);flex:none;cursor:text;contain:layout paint}',
   // A page still loading: a soft grey shimmer instead of a blank white box.
   // The sweep is a transformed pseudo-element, so the GPU moves it without
   // repainting the page each frame (animating background-position did).
@@ -114,6 +120,13 @@ const CSS = [
   // The passage a link points at: a yellow highlight that fades in, holds, and fades out.
   '.dpa-mark{position:absolute;background:rgba(250,204,21,.55);mix-blend-mode:multiply;pointer-events:none;border-radius:2px;z-index:2;opacity:0;animation:dpa-fade 3.3s ease-in-out forwards}',
   '@keyframes dpa-fade{0%{opacity:0}8%{opacity:1}55%{opacity:1}100%{opacity:0}}',
+  // Find hits stay on the page until the query changes (unlike the fading link mark).
+  '.dpa-find{position:absolute;background:rgba(250,204,21,.5);box-shadow:0 0 0 1px rgba(217,119,6,.8);pointer-events:none;border-radius:2px;z-index:3}',
+  '.dpa-findbar{display:flex;align-items:center;gap:2px;flex:none}',
+  '.dpa-findbar input{width:76px;text-align:left}',
+  '.dpa-findbar input::placeholder{opacity:.6}',
+  '.dpa-findcount{min-width:26px;text-align:center;font-size:11px;opacity:.8;font-variant-numeric:tabular-nums}',
+  '.dpa-findbar .dpa-btn{padding:2px 5px}',
   '.dpa-toast{position:fixed;z-index:1002;padding:7px 11px;border-radius:8px;background:#1f2937;color:#f3f4f6;font:12px/1.4 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.35);transition:opacity .35s;pointer-events:none}',
   '.dpa-toast.dpa-toast-out{opacity:0}',
   '.dpa-pop{position:fixed;z-index:1000;display:flex;gap:2px;padding:3px;border-radius:9px;background:#1f2937;box-shadow:0 6px 24px rgba(0,0,0,.4);font-size:12px}',
@@ -369,6 +382,13 @@ function PdfAskBody(props) {
   const [engineNote, setEngineNote] = useState('');
   /** 这次翻译实际会用哪个 provider/model（服务端算好给界面看）。 */
   const [resolved, setResolved] = useState(null);
+  /** 页内查找：输入串、命中列表（null = 还没查过）、当前第几处、是否在查。 */
+  const [findQuery, setFindQuery] = useState('');
+  const [findHits, setFindHits] = useState(null);
+  const [findAt, setFindAt] = useState(-1);
+  const [findBusy, setFindBusy] = useState(false);
+  /** 只让最后一次查询的结果落地：打字快时更早的查询会晚回来。 */
+  const findSeq = useRef(0);
   const longPress = useRef(null);
   const longFired = useRef(false);
 
@@ -439,6 +459,10 @@ function PdfAskBody(props) {
     // used to overwrite this value in the same tick, so every re-open went to 1.
     const remembered = memory.get(address);
     setStatus({ phase: 'loading' });
+    // A different file: old hit boxes belong to another document.
+    setFindQuery('');
+    setFindHits(null);
+    setFindAt(-1);
     view.open(bytes).then(() => {
       if (cancelled) return;
       unregister = registry.add(address, file, view, pathOfAddress(address));
@@ -465,6 +489,35 @@ function PdfAskBody(props) {
       viewRef.current = null;
     };
   }, [bytes, address, file]);
+
+  // 页内查找：停手 300ms 才真查（整份文档走 pdf.js 文字层），后发的查询作废旧结果。
+  useEffect(() => {
+    const view = viewRef.current;
+    if (status.phase !== 'ready' || !view) return undefined;
+    const query = findQuery.trim();
+    const seq = (findSeq.current += 1);
+    if (query.length < 2) {
+      setFindBusy(false);
+      setFindHits(null);
+      setFindAt(-1);
+      view.clearFind();
+      return undefined;
+    }
+    setFindBusy(true);
+    const timer = setTimeout(() => {
+      view.findText(query).then((hits) => {
+        if (seq !== findSeq.current || viewRef.current !== view) return;
+        setFindBusy(false);
+        setFindHits(hits);
+        setFindAt(hits.length ? 0 : -1);
+        if (hits.length) view.showHit(hits[0].page, hits[0].boxes);
+        else view.clearFind();
+      }, () => {
+        if (seq === findSeq.current) setFindBusy(false);
+      });
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [findQuery, status.phase]);
 
   // The selection: toolbar, handles, keyboard. Everything is recomputed from
   // the live DOM selection, so native drags, handle drags, Shift+click and
@@ -996,6 +1049,21 @@ function PdfAskBody(props) {
     setZoomLabel(`${Math.round(view.scale * 100)}%`);
   };
 
+  /** 跳到下一处/上一处查找命中（循环）。 */
+  const findStep = (delta) => {
+    if (!findHits || !findHits.length) return;
+    const at = stepHit(findAt, delta, findHits.length);
+    setFindAt(at);
+    viewRef.current?.showHit(findHits[at].page, findHits[at].boxes);
+  };
+  const clearFind = () => {
+    setFindQuery('');
+    setFindHits(null);
+    setFindAt(-1);
+    setFindBusy(false);
+    viewRef.current?.clearFind();
+  };
+
   const popStyle = pop
     ? (() => {
         const anchor = pop.anchor;
@@ -1054,6 +1122,36 @@ function PdfAskBody(props) {
         onBlur: () => goToPage(pageInput),
       }),
       h('span', { className: 'dpa-count' }, ready ? `/ ${status.pages} 页` : ''),
+      h(
+        'div',
+        { className: 'dpa-findbar' },
+        h('input', {
+          value: findQuery,
+          'aria-label': '在 PDF 中查找',
+          placeholder: '查找',
+          title: '输入两个字以上开始查找；回车下一处，Shift+回车上一处，Esc 清空',
+          disabled: !ready,
+          onChange: (event) => setFindQuery(event.target.value),
+          onKeyDown: (event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              findStep(event.shiftKey ? -1 : 1);
+            } else if (event.key === 'Escape') {
+              event.preventDefault();
+              clearFind();
+            }
+          },
+        }),
+        findBusy || (findHits && findHits.length)
+          ? h('span', { className: 'dpa-findcount' }, findBusy ? '…' : (findHits.length ? `${findAt + 1}/${findHits.length}` : '无'))
+          : null,
+        findHits && findHits.length
+          ? h('button', { type: 'button', className: 'dpa-btn', title: '上一处（Shift+回车）', onClick: () => findStep(-1) }, '↑')
+          : null,
+        findHits && findHits.length
+          ? h('button', { type: 'button', className: 'dpa-btn', title: '下一处（回车）', onClick: () => findStep(1) }, '↓')
+          : null,
+      ),
       h('span', { className: 'dpa-spacer' }),
       note ? h('span', { className: `dpa-note${note.error ? ' dpa-err' : ''}`, title: note.text }, note.text) : h('span', { className: 'dpa-note' }, '选中文字即可翻译、引用或提问'),
       h('span', { className: 'dpa-spacer' }),
