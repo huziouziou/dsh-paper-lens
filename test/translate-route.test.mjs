@@ -348,6 +348,39 @@ test('the explicit-model engine needs both provider and model', async () => {
   }
 });
 
+test('a pinned model that keeps failing falls back to the session model', async () => {
+  const calls = [];
+  const llm = {
+    stream(options) {
+      calls.push(`${options.provider}/${options.model}`);
+      if (options.provider === 'pinned-provider') {
+        return (async function* () {
+          yield { type: 'finish', reason: { kind: 'error', error: { status: 503, message: 'overloaded' } } };
+        })();
+      }
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: '会话模型译出来了。' };
+        yield { type: 'finish', reason: 'stop' };
+      })();
+    },
+  };
+  const { handler, dir } = harnessWith({
+    engine: 'model',
+    provider: 'pinned-provider',
+    model: 'pinned-model',
+    reasoning: 'off',
+  }, llm);
+  try {
+    const out = await request(handler, { text: 'Hello.' });
+    const rows = lines(out);
+    assert.equal(rows.filter((r) => r.delta).map((r) => r.delta).join(''), '会话模型译出来了。');
+    assert.match(rows.find((r) => r.done)?.warning ?? '', /已改用会话模型/);
+    assert.ok(calls.includes('default-provider/default-model'), '退路用的是会话默认模型');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a local API that is down says how to start it, instead of "fetch failed"', async () => {
   const { handler, dir } = harnessWith({
     engine: 'api',

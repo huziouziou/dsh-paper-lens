@@ -358,12 +358,15 @@ export function describeTranslateRoute(scope, settings) {
  * 界面是流式的（边出边看），所以正常路径下 `out` 只是给调用方核对用的；
  * 只有「模型没给出任何文字」时才用它判断失败。
  */
-export async function translateText(llm, selection, text, { maxChars = MAX_TRANSLATE_CHARS, sessionId, onDelta, maxTokens, reasoningEffort = 'off', targetLang = DEFAULT_TARGET_LANG } = {}) {
+export async function translateText(llm, selection, text, { maxChars = MAX_TRANSLATE_CHARS, sessionId, onDelta, maxTokens, reasoningEffort = 'off', targetLang = DEFAULT_TARGET_LANG, retryDelays = [700, 1800] } = {}) {
   const clipped = String(text ?? '').slice(0, maxChars);
   let out = '';
   const chunkKinds = {};
   let finishReason = '';
   let failure = null;
+  // What the provider said (code/status/message). Kept apart from `failure`: the
+  // retry below must still fire for a 503, it only needs the reason for the card.
+  let failureInfo = null;
   let emitted = false;
 
   const request = (extra = {}) => ({
@@ -395,6 +398,15 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
     if (kind === 'finish') {
       const reason = chunk.reason;
       finishReason = typeof reason === 'string' ? reason : String(reason?.kind ?? reason?.type ?? '');
+      // 有些 provider 把失败原因塞在 finish 里（`reason.error` / `reason.message`），
+      // 不单独发 failure 分片。留着它，报错卡才能说出「HTTP 503」而不是只有「error」。
+      const detail = typeof reason === 'object' && reason !== null ? (reason.error ?? reason) : null;
+      const message = typeof detail?.message === 'string' ? detail.message : '';
+      const status = detail?.status ?? detail?.statusCode;
+      const code = detail?.code;
+      if ((message || status != null || code) && !failureInfo) {
+        failureInfo = { code, status, message };
+      }
     }
     if (chunk?.failure) failure = chunk.failure;
   };
@@ -418,6 +430,7 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
     out = '';
     finishReason = '';
     failure = null;
+    failureInfo = null;
     for (const key of Object.keys(chunkKinds)) delete chunkKinds[key];
   };
   const budget = maxTokens ?? translationMaxTokens(clipped);
@@ -453,10 +466,13 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
   if (!emitted && !failure && /max[-_]?tokens|length/i.test(finishReason)) {
     await runClean({ maxTokens: Math.min(8192, Math.max(budget, 2048) * 2) });
   }
-  // A bare `finish(reason: 'error')` with nothing emitted is usually the provider
-  // failing one request, not the model refusing the task: one more try with the
-  // same budget turns most of these into a normal answer instead of an error card.
-  if (!emitted && !failure && finishReason === 'error') {
+  // A bare `finish(reason: 'error')` with nothing emitted is the provider failing
+  // the request (503/overloaded in bursts), not the model refusing the task. One
+  // immediate retry lands on the same bad second, so back off a little and give it
+  // two more chances before showing an error card at all.
+  for (const delay of retryDelays) {
+    if (emitted || failure || finishReason !== 'error') break;
+    await new Promise((resolve) => setTimeout(resolve, delay));
     await runClean({ maxTokens: Math.max(budget, 2048) });
   }
 
@@ -466,6 +482,7 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
     chunkKinds,
     finishReason,
     failure,
+    failureInfo,
     truncated: /max[-_]?tokens|length/i.test(String(finishReason)),
   };
 }
@@ -481,9 +498,10 @@ export function isUnsupportedReasoningEffort(error) {
 /** 把失败原因拼成一行能查的说明：分片直方图 + 失败码 + 结束原因。 */
 function translateFailureText(selection, result) {
   const kinds = Object.entries(result.chunkKinds ?? {}).map(([k, n]) => `${k}×${n}`).join('、') || '无分片';
-  const code = result.failure?.code ?? '';
-  const message = result.failure?.message ?? '';
-  const status = result.failure?.status != null ? `HTTP ${result.failure.status}` : '';
+  const info = result.failure ?? result.failureInfo ?? {};
+  const code = info.code ?? '';
+  const message = String(info.message ?? '').slice(0, 160);
+  const status = info.status != null ? `HTTP ${info.status}` : '';
   const why = [code && `失败码 ${code}`, status, message, result.finishReason && `结束原因 ${result.finishReason}`]
     .filter(Boolean).join('；') || '未给出结束原因';
   return `模型没有返回译文（模型 ${selection.provider}/${selection.model}；收到 ${kinds}；${why}）`;
@@ -868,6 +886,19 @@ export function apply(ctx, config = {}) {
         }
       }
       const identity = usingApi ? { provider: `api:${settings.baseURL}`, model: settings.model } : selection;
+      // 「指定模型」留一条退路：上游 503/超时时改用本会话实际路由的模型，让「翻译失败」
+      // 退化成「慢一点但出得来」。自定义 API 的失败是地址/服务问题，换模型没有意义。
+      let fallbackSelection = null;
+      if (settings.engine === 'model') {
+        try {
+          const routed = agentBySession.get(sessionId)?.session?.requestHeader?.()?.config;
+          if (routed?.provider && routed?.model) fallbackSelection = { provider: routed.provider, model: routed.model };
+        } catch { /* 没有该会话时用默认模型 */ }
+        fallbackSelection ??= pickSelection(scope, config);
+        if (fallbackSelection?.provider === selection.provider && fallbackSelection?.model === selection.model) {
+          fallbackSelection = null;
+        }
+      }
       // 流式：校验通过后就发头，之后一行一个 JSON 对象（NDJSON）：
       //   {"delta":"…"}  增量文字
       //   {"error":"…"}  失败（含分片直方图与失败码）
@@ -899,7 +930,7 @@ export function apply(ctx, config = {}) {
         while (translateCache.size > TRANSLATE_CACHE_MAX) translateCache.delete(translateCache.keys().next().value);
       };
       /** One passage: the explicit API engine streams itself, everything else goes through the host. */
-      const runTranslation = (part, onDelta) => {
+      const runTranslation = (part, onDelta, route = selection) => {
         const maxTokens = translationMaxTokens(part);
         if (usingApi) {
           return translateViaApi({
@@ -912,13 +943,23 @@ export function apply(ctx, config = {}) {
             onDelta,
           });
         }
-        return translateText(llm, selection, part, {
+        return translateText(llm, route, part, {
           sessionId,
           maxTokens,
           reasoningEffort,
           targetLang,
           onDelta,
         });
+      };
+      /** 指定模型的请求彻底失败时，用会话模型再译一次（不写缓存，气泡里说明换过模型）。 */
+      const runWithFallback = async (part, onDelta) => {
+        const result = await runTranslation(part, onDelta);
+        if (result.translation || !fallbackSelection) return result;
+        const retried = await runTranslation(part, onDelta, fallbackSelection);
+        if (retried.translation) {
+          retried.note = `指定模型（${selection.provider} / ${selection.model}）没返回译文，这一段已改用会话模型（${fallbackSelection.provider} / ${fallbackSelection.model}）。`;
+        }
+        return retried;
       };
       try {
         // 多段长选区：各段并行请求，第一段仍实时出字，其余段到了按顺序补。
@@ -928,7 +969,7 @@ export function apply(ctx, config = {}) {
         const groups = paragraphs.length >= 2 && text.length >= 300 ? groupParagraphs(paragraphs, 3) : [];
         if (groups.length >= 2) {
           const buffers = groups.map(() => '');
-          const tasks = groups.map((part, i) => runTranslation(part, i === 0 ? (delta) => push({ delta }) : (delta) => { buffers[i] += delta; }));
+          const tasks = groups.map((part, i) => runWithFallback(part, i === 0 ? (delta) => push({ delta }) : (delta) => { buffers[i] += delta; }));
           const first = await tasks[0];
           if (!first.translation) {
             push({ error: translateFailureText(identity, first) });
@@ -938,7 +979,7 @@ export function apply(ctx, config = {}) {
             push({ done: true, warning: translateTruncatedText(first) });
           } else {
             let combined = first.translation;
-            let warning = null;
+            let warning = first.note ?? null;
             for (let i = 1; i < groups.length; i += 1) {
               const result = await tasks[i];
               if (!result.translation) {
@@ -950,6 +991,7 @@ export function apply(ctx, config = {}) {
                 warning = translateTruncatedText(result);
                 break;
               }
+              if (result.note && !warning) warning = result.note;
               push({ delta: `\n\n${result.translation}` });
               combined += `\n\n${result.translation}`;
             }
@@ -960,9 +1002,10 @@ export function apply(ctx, config = {}) {
             }
           }
         } else {
-          const result = await runTranslation(text, (delta) => push({ delta }));
+          const result = await runWithFallback(text, (delta) => push({ delta }));
           if (!result.translation) push({ error: translateFailureText(identity, result) });
           else if (result.truncated) push({ done: true, warning: translateTruncatedText(result) });
+          else if (result.note) push({ done: true, warning: result.note });
           else {
             remember(result.translation);
             push({ done: true });

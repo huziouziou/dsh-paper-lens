@@ -264,10 +264,29 @@ test('a bare finish(reason: error) with nothing emitted is retried once before f
     },
   };
   // reasoningEffort: false -> 不走 effort 探测，直接测「纯 error 重试一次」。
-  const out = await translateText(llm, selection, 'x', { reasoningEffort: false });
+  const out = await translateText(llm, selection, 'x', { reasoningEffort: false, retryDelays: [0] });
   assert.equal(calls, 2);
   assert.equal(out.translation, '第二次就正常了。');
   assert.equal(out.finishReason, 'stop');
+});
+
+test('a provider that keeps failing gets two backed-off retries and keeps the reason', async () => {
+  let calls = 0;
+  const llm = {
+    stream() {
+      calls += 1;
+      return (async function* () {
+        yield { type: 'usage', inputTokens: 10 };
+        // 有些 provider 把失败原因塞在 finish 里，没有单独的 failure 分片。
+        yield { type: 'finish', reason: { kind: 'error', error: { status: 503, message: 'overloaded' } } };
+      })();
+    },
+  };
+  const out = await translateText(llm, selection, 'x', { reasoningEffort: false, retryDelays: [0, 0] });
+  assert.equal(calls, 3, '一次首发 + 两次退避重试');
+  assert.equal(out.translation, '');
+  assert.equal(out.finishReason, 'error');
+  assert.deepEqual(out.failureInfo, { code: undefined, status: 503, message: 'overloaded' });
 });
 
 test('an effort the provider turned down is not probed again on the next translation', async () => {
