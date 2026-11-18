@@ -1,6 +1,6 @@
 {
   "name": "dsh-paper-lens",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Paper Lens: read PDFs in the DSH right sidebar, select text to translate (streaming, 10 languages), quote it into the chat, and annotate. Runs on the session model, a pinned model, or a local llama.cpp translation server. 论文阅读：侧边栏 PDF、划词翻译、划词引用、批注。",
   "publishConfig": {
     "access": "public"

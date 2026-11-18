@@ -5,7 +5,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -13,6 +13,7 @@ import {
   buildStartScript,
   findServer,
   MODEL_FILE,
+  MODEL_MIN_BYTES,
   presetFor,
   probeLocalServers,
   readLocalFiles,
@@ -87,7 +88,7 @@ test('readLocalFiles reports what is already there, and writeStartScript fills t
     writeFileSync(join(dir, MODEL_FILE), 'x'.repeat(64));
     writeFileSync(join(dir, serverName), 'y');
     const before = readLocalFiles(dir);
-    assert.equal(before.model.ok, true);
+    assert.equal(before.model.ok, false);
     assert.equal(before.server.ok, true);
     assert.equal(before.script.ok, false);
 
@@ -95,6 +96,26 @@ test('readLocalFiles reports what is already there, and writeStartScript fills t
     assert.equal(scriptPath, before.script.path);
     const after = readLocalFiles(dir);
     assert.equal(after.script.ok, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a cancelled download leaves a file that is not mistaken for a finished model', () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(join(dir, MODEL_FILE), '');
+    truncateSync(join(dir, MODEL_FILE), MODEL_MIN_BYTES - 1);
+    assert.equal(readLocalFiles(dir).model.ok, false);
+
+    truncateSync(join(dir, MODEL_FILE), MODEL_MIN_BYTES);
+    assert.equal(readLocalFiles(dir).model.ok, true);
+
+    // A short model must not be offered as a ready preset either.
+    const preset = presetFor({
+      files: { dir, model: { path: join(dir, MODEL_FILE), ok: false, bytes: 1024 }, server: { ok: false }, script: { ok: false } },
+    });
+    assert.equal(preset.ready, false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -38,14 +38,22 @@ function sizeOf(path) {
   }
 }
 
+/**
+ * Roughly the size of the published model. A cancelled download leaves a short
+ * file behind, and "the file exists" is not enough to run it: llama.cpp would
+ * load a truncated gguf and fail with a confusing message.
+ */
+export const MODEL_MIN_BYTES = 1000 * 1000 * 1000;
+
 /** What is already on disk, without touching the network. */
 export function readLocalFiles(dir) {
   const modelPath = join(dir, MODEL_FILE);
   const scriptPath = join(dir, process.platform === 'win32' ? 'start-llama.bat' : 'start-llama.sh');
   const serverPath = findServer(dir);
+  const modelBytes = sizeOf(modelPath);
   return {
     dir,
-    model: { path: modelPath, ok: sizeOf(modelPath) > 0, bytes: sizeOf(modelPath) },
+    model: { path: modelPath, ok: modelBytes >= MODEL_MIN_BYTES, bytes: modelBytes },
     server: { path: serverPath ?? '', ok: Boolean(serverPath), bytes: serverPath ? sizeOf(serverPath) : 0 },
     script: { path: scriptPath, ok: existsSync(scriptPath) },
   };
@@ -199,8 +207,12 @@ async function fetchToFile(url, dest, { onProgress, signal, label }) {
   }
   const totalHeader = response.headers.get('content-range')?.split('/')?.[1];
   const total = Number(totalHeader ?? response.headers.get('content-length') ?? 0) || 0;
-  let received = partial;
-  const stream = createWriteStream(dest, { flags: partial > 0 ? 'a' : 'w' });
+  // A mirror that ignores Range answers 200 with the whole file; appending that
+  // to the partial file would corrupt it, so start over in that case.
+  const resumed = response.status === 206; // Partial Content
+  let received = resumed ? partial : 0;
+  if (!resumed) onProgress(0, total);
+  const stream = createWriteStream(dest, { flags: resumed ? 'a' : 'w' });
   try {
     for await (const chunk of response.body) {
       received += chunk.length;
@@ -210,7 +222,7 @@ async function fetchToFile(url, dest, { onProgress, signal, label }) {
   } finally {
     await new Promise((resolve) => stream.end(resolve));
   }
-  return { bytes: received, total };
+  return { bytes: received, total, resumed };
 }
 
 async function unpack(zipPath, dir, signal) {
@@ -246,7 +258,7 @@ export async function startLocalDownload(env = {}) {
     if (process.platform !== 'win32') {
       throw new Error('一键下载目前只支持 Windows；其他系统请用系统包管理器装 llama.cpp，再把它的可执行文件填进「启动命令」。');
     }
-    if (!existsSync(modelPath) || sizeOf(modelPath) < 1024) {
+    if (sizeOf(modelPath) < MODEL_MIN_BYTES) {
       const urls = [MODEL_URL, MODEL_URL_ALT];
       let lastError = null;
       for (const url of urls) {
@@ -260,6 +272,9 @@ export async function startLocalDownload(env = {}) {
         }
       }
       if (lastError) throw lastError;
+      if (sizeOf(modelPath) < MODEL_MIN_BYTES) {
+        throw new Error('模型文件不完整（下载中断过），再点一次「下载」会接着下。');
+      }
     }
     downloadState = { ...downloadState, phase: 'server', received: 0, total: 0, message: '下载 llama.cpp…' };
     const serverFound = findServer(dir);

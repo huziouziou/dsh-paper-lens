@@ -40,7 +40,9 @@ const LANGS = [
   ['ru', 'Русский'],
   ['ar', 'العربية'],
 ];
-const REASONING = [['auto', '自动'], ['off', '关闭'], ['low', '低'], ['medium', '中'], ['high', '高']];
+// 推理强度不再出现在设置面板：默认「自动」跟随插件配置 translateReasoning 就够了，
+// 五档下拉对读论文的人没有可判断的差别，而「关闭」在部分 provider 上只会白花一次请求。
+// 旧设置里的非 auto 值仍会被服务端读取并生效，界面只是不再提供修改入口。
 const ENGINES = [
   ['session', '跟随会话'],
   ['model', '指定模型'],
@@ -183,6 +185,9 @@ const CSS = [
   '.dpa-engine-fields input{flex:1;min-width:0;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));border-radius:5px;padding:3px 6px;font:inherit;background:var(--dsw-alias-bg-layer-1,rgba(255,255,255,.7));color:inherit}',
   '.dpa-engine-fields select{flex:1;min-width:0;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));border-radius:5px;padding:3px 6px;font:inherit;background:var(--dsw-alias-bg-layer-1,rgba(255,255,255,.7));color:inherit}',
   '.dpa-engine-actions{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap}',
+  '.dpa-lang-row{display:flex;align-items:center;gap:6px;font-size:12px;opacity:.9;min-width:0}',
+  '.dpa-lang-row select{max-width:150px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.18));border-radius:5px;padding:2px 4px;font:inherit;background:var(--dsw-alias-bg-layer-1,rgba(255,255,255,.7));color:inherit}',
+  '.dpa-advanced{margin-top:8px;padding-top:6px;border-top:1px dashed var(--dsw-alias-border-l2,rgba(0,0,0,.14))}',
   '.dpa-engine-note{font-size:11px;opacity:.8}',
   '.dpa-engine-hint{font-size:11px;opacity:.65;margin-top:6px;line-height:1.5}',
   '.dpa-local-status{font-size:11px;opacity:.8;margin-bottom:6px;line-height:1.5;word-break:break-all}',
@@ -375,6 +380,8 @@ function PdfAskBody(props) {
   /** 字号与气泡宽度，localStorage 持久化。 */
   const [prefs, setPrefs] = useState(() => loadPrefs());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** 设置面板的「高级设置」是否展开：引擎字段、key、本地模型这些不常用的藏在这里。 */
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   /** 服务端保存的翻译引擎设置（key 只以 hasKey 的形式回来）。 */
   const [engine, setEngine] = useState(DEFAULT_ENGINE);
   /** 设置面板里正在编辑的一份；保存成功后再覆盖 engine。 */
@@ -985,7 +992,7 @@ function PdfAskBody(props) {
   const changePrefs = (patch) => setPrefs((current) => savePrefs({ ...current, ...patch }));
 
   /** 文本框改动先留在表单里，等「保存引擎设置」；离散选项改动即保存。 */
-  const markDirtyField = () => setEngineNote('有未保存的改动，点「保存引擎设置」生效');
+  const markDirtyField = () => setEngineNote('有未保存的改动，点「保存」生效');
 
   /** 保存翻译引擎设置。
    *  带 patch 的调用来自「改动即生效」的离散选项，只发被改的那几项——避免用
@@ -1199,6 +1206,112 @@ function PdfAskBody(props) {
     if (localFiles?.model?.ok) return '模型已下载，还缺 llama-server';
     return '还没准备：可以先找本机已有的服务，或下载一份（约 1.1 GB）。';
   })();
+  /**
+   * 设置面板里「高级设置」展开后的内容：引擎字段、保存按钮、本地模型。
+   * 这些平时不用改，收起来之后面板只剩主题、字号、引擎、语言四行。
+   */
+  const advancedSettings = !advancedOpen
+    ? null
+    : h(
+        'div',
+        { className: 'dpa-advanced' },
+        engineForm.engine === 'model'
+          ? h(
+              'div',
+              { className: 'dpa-engine-fields' },
+              h('label', null, h('span', null, 'provider'), h('input', {
+                value: engineForm.provider,
+                placeholder: 'opencode-go',
+                onChange: (event) => { setEngineForm((form) => ({ ...form, provider: event.target.value })); markDirtyField(); },
+              })),
+              h('label', null, h('span', null, 'model'), h('input', {
+                value: engineForm.model,
+                placeholder: 'claude-haiku-5-5',
+                onChange: (event) => { setEngineForm((form) => ({ ...form, model: event.target.value })); markDirtyField(); },
+              })),
+            )
+          : null,
+        engineForm.engine === 'api'
+          ? h(
+              'div',
+              { className: 'dpa-engine-fields' },
+              h('label', null, h('span', null, '接口地址'), h('input', {
+                value: engineForm.baseURL,
+                placeholder: 'https://api.example.com/v1',
+                onChange: (event) => { setEngineForm((form) => ({ ...form, baseURL: event.target.value })); markDirtyField(); },
+              })),
+              h('label', null, h('span', null, '模型名'), h('input', {
+                value: engineForm.model,
+                placeholder: 'gpt-4o-mini',
+                onChange: (event) => { setEngineForm((form) => ({ ...form, model: event.target.value })); markDirtyField(); },
+              })),
+              h('label', null, h('span', null, 'API key'), h('input', {
+                type: 'password',
+                value: engineForm.apiKey,
+                placeholder: engine.hasKey ? '已保存；留空不修改' : '可留空（本地模型）',
+                onChange: (event) => { setEngineForm((form) => ({ ...form, apiKey: event.target.value })); markDirtyField(); },
+              })),
+              h('label', null, h('span', null, '启动命令'), h('input', {
+                value: engineForm.localCommand,
+                placeholder: 'D:\\Models\\hy-mt\\start-llama.bat',
+                onChange: (event) => { setEngineForm((form) => ({ ...form, localCommand: event.target.value })); markDirtyField(); },
+              })),
+              h('label', { className: 'dpa-check' },
+                h('input', {
+                  type: 'checkbox',
+                  checked: engineForm.localAutoStart === true,
+                  onChange: (event) => saveEngine({ localAutoStart: event.target.checked }),
+                }),
+                '翻译时自动启动本地服务（空闲十分钟后关掉）'),
+            )
+          : null,
+        h(
+          'div',
+          { className: 'dpa-engine-actions' },
+          h('button', {
+            type: 'button',
+            className: 'dpa-btn',
+            disabled: engineBusy || !engineReady,
+            title: engineReady ? '' : '还没从服务端读回已保存的设置，先点开面板重新拉一次',
+            onClick: () => saveEngine(),
+          }, engineBusy ? '保存中…' : '保存'),
+          engine.engine === 'api' && engine.hasKey
+            ? h('button', {
+                type: 'button',
+                className: 'dpa-small',
+                disabled: engineBusy,
+                onClick: clearEngineKey,
+              }, '清除 key')
+            : null,
+          engineNote ? h('span', { className: 'dpa-engine-note' }, engineNote) : null,
+        ),
+        h(
+          'div',
+          { className: 'dpa-engine dpa-local' },
+          h('div', { className: 'dpa-engine-head' }, '本地模型（离线）'),
+          h('div', { className: 'dpa-local-status' }, localStatusText),
+          h(
+            'div',
+            { className: 'dpa-engine-actions' },
+            h('button', {
+              type: 'button',
+              className: 'dpa-btn',
+              disabled: localBusy || localDownloading,
+              onClick: useLocalModel,
+            }, localBusy ? '检测中…' : '使用本地模型'),
+            localDownloading
+              ? h('button', { type: 'button', className: 'dpa-small', onClick: cancelLocalModel }, '取消下载')
+              : h('button', {
+                  type: 'button',
+                  className: 'dpa-small',
+                  disabled: localBusy,
+                  onClick: downloadLocalModel,
+                }, localFiles?.model?.ok ? '补下 llama.cpp（约 24 MB）' : '下载（约 1.1 GB）'),
+          ),
+          localNote ? h('div', { className: 'dpa-engine-note' }, localNote) : null,
+          h('div', { className: 'dpa-engine-hint' }, '先找本机已在运行的服务（8080 / 1234 / 11434 / 8000 / 30000），没有才下载 hy-mt 1.8B 与 llama.cpp；文件放在插件数据目录，不进 npm 包。'),
+        ),
+      );
   /** 跳到输入框里的页码；超出总页数时夹到最后一页，并把输入框改回真实页码。 */
   const goToPage = (raw) => {
     const target = Math.floor(Number(raw));
@@ -1324,7 +1437,7 @@ function PdfAskBody(props) {
       note ? h('span', { className: `dpa-note${note.error ? ' dpa-err' : ''}`, title: note.text }, note.text) : h('span', { className: 'dpa-note' }, '选中文字即可翻译、引用或提问'),
       h('span', { className: 'dpa-spacer' }),
       h('button', { type: 'button', className: 'dpa-btn', title: '查看/删除本 PDF 的批注', onClick: () => { setMarksOpen((v) => !v); setSettingsOpen(false); setMarkDetail(null); } }, marks.length ? `批注 ${marks.length}` : '批注'),
-      h('button', { type: 'button', className: 'dpa-btn', title: '字号与气泡宽度', onClick: () => { const next = !settingsOpen; setSettingsOpen(next); setMarksOpen(false); if (next) { setEngineNote(''); setLocalNote(''); refreshEngine(); readLocal(); } } }, '设置'),
+      h('button', { type: 'button', className: 'dpa-btn', title: '显示、翻译与本地模型设置', onClick: () => { const next = !settingsOpen; setSettingsOpen(next); setMarksOpen(false); if (next) { setEngineNote(''); setLocalNote(''); refreshEngine(); readLocal(); } else { setAdvancedOpen(false); } } }, '设置'),
       h('button', { type: 'button', className: 'dpa-btn', title: '缩小', disabled: !ready, onClick: () => zoom(-1) }, '−'),
       h('span', { style: { minWidth: '38px', textAlign: 'center' } }, zoomLabel),
       h('button', { type: 'button', className: 'dpa-btn', title: '放大', disabled: !ready, onClick: () => zoom(1) }, '+'),
@@ -1606,139 +1719,22 @@ function PdfAskBody(props) {
                 onClick: () => saveEngine({ engine: value }),
               }, label)),
             ),
-            engineForm.engine === 'model'
-              ? h(
-                  'div',
-                  { className: 'dpa-engine-fields' },
-                  h('label', null, h('span', null, 'provider'), h('input', {
-                    value: engineForm.provider,
-                    placeholder: 'opencode-go',
-                    onChange: (event) => { setEngineForm((form) => ({ ...form, provider: event.target.value })); markDirtyField(); },
-                  })),
-                  h('label', null, h('span', null, 'model'), h('input', {
-                    value: engineForm.model,
-                    placeholder: 'claude-haiku-5-5',
-                    onChange: (event) => { setEngineForm((form) => ({ ...form, model: event.target.value })); markDirtyField(); },
-                  })),
-                )
-              : null,
-            engineForm.engine === 'api'
-              ? h(
-                  'div',
-                  { className: 'dpa-engine-fields' },
-                  h('label', null, h('span', null, '接口地址'), h('input', {
-                    value: engineForm.baseURL,
-                    placeholder: 'https://api.example.com/v1',
-                    onChange: (event) => { setEngineForm((form) => ({ ...form, baseURL: event.target.value })); markDirtyField(); },
-                  })),
-                  h('label', null, h('span', null, '模型名'), h('input', {
-                    value: engineForm.model,
-                    placeholder: 'gpt-4o-mini',
-                    onChange: (event) => { setEngineForm((form) => ({ ...form, model: event.target.value })); markDirtyField(); },
-                  })),
-                  h('label', null, h('span', null, 'API key'), h('input', {
-                    type: 'password',
-                    value: engineForm.apiKey,
-                    placeholder: engine.hasKey ? '已保存；留空不修改' : '可留空（本地模型）',
-                    onChange: (event) => { setEngineForm((form) => ({ ...form, apiKey: event.target.value })); markDirtyField(); },
-                  })),
-                  h('label', null, h('span', null, '启动命令'), h('input', {
-                    value: engineForm.localCommand,
-                    placeholder: 'D:\\Models\\hy-mt\\start-llama.bat',
-                    onChange: (event) => { setEngineForm((form) => ({ ...form, localCommand: event.target.value })); markDirtyField(); },
-                  })),
-                  h('label', { className: 'dpa-check' },
-                    h('input', {
-                      type: 'checkbox',
-                      checked: engineForm.localAutoStart === true,
-                      onChange: (event) => saveEngine({ localAutoStart: event.target.checked }),
-                    }),
-                    '翻译时自动启动本地服务（空闲十分钟后关掉）'),
-                )
-              : null,
             h(
               'div',
               { className: 'dpa-engine-actions' },
+              h('label', { className: 'dpa-lang-row' }, '译文',
+                h('select', {
+                  value: engineForm.targetLang,
+                  onChange: (event) => saveEngine({ targetLang: event.target.value }),
+                }, LANGS.map(([value, label]) => h('option', { key: value, value }, label)))),
+              h('span', { className: 'dpa-spacer' }),
               h('button', {
                 type: 'button',
-                className: 'dpa-btn',
-                disabled: engineBusy || !engineReady,
-                title: engineReady ? '' : '还没从服务端读回已保存的设置，先点开面板重新拉一次',
-                onClick: () => saveEngine(),
-              }, engineBusy ? '保存中…' : '保存引擎设置'),
-              engine.engine === 'api' && engine.hasKey
-                ? h('button', {
-                    type: 'button',
-                    className: 'dpa-small',
-                    disabled: engineBusy,
-                    onClick: clearEngineKey,
-                  }, '清除 key')
-                : null,
-              engineNote ? h('span', { className: 'dpa-engine-note' }, engineNote) : null,
+                className: 'dpa-small',
+                onClick: () => setAdvancedOpen((open) => !open),
+              }, advancedOpen ? '收起高级设置' : '高级设置'),
             ),
-            h('div', { className: 'dpa-engine-hint' }, engineForm.engine === 'session'
-              ? '默认：用当前对话实际路由的模型和凭据，不额外配置。三种引擎互斥，只有选中的这一种生效。'
-              : engineForm.engine === 'model'
-                ? '仍走宿主模型服务（凭据、代理都在宿主里），只换 provider/model；三种引擎互斥，只按这一种走。'
-                : '直连 OpenAI 兼容的 /chat/completions；key 只保存在本机的 dsh-paper-lens.json 里。指向 127.0.0.1/localhost 时，填「启动命令」可让插件按需拉起，空闲十分钟后关掉。'),
-          ),
-          h(
-            'div',
-            { className: 'dpa-engine dpa-local' },
-            h('div', { className: 'dpa-engine-head' }, '本地模型（离线）'),
-            h('div', { className: 'dpa-local-status' }, localStatusText),
-            h(
-              'div',
-              { className: 'dpa-engine-actions' },
-              h('button', {
-                type: 'button',
-                className: 'dpa-btn',
-                disabled: localBusy || localDownloading,
-                onClick: useLocalModel,
-              }, localBusy ? '检测中…' : '使用本地模型（离线）'),
-              localDownloading
-                ? h('button', {
-                    type: 'button',
-                    className: 'dpa-small',
-                    onClick: cancelLocalModel,
-                  }, '取消下载')
-                : h('button', {
-                    type: 'button',
-                    className: 'dpa-small',
-                    disabled: localBusy,
-                    onClick: downloadLocalModel,
-                  }, localFiles?.model?.ok ? '补下 llama.cpp（约 24 MB）' : '下载模型与 llama.cpp（约 1.1 GB）'),
-            ),
-            localNote ? h('div', { className: 'dpa-engine-note' }, localNote) : null,
-            h('div', { className: 'dpa-engine-hint' }, '先找本机已经在跑的 LM Studio / Ollama / llama.cpp（8080、1234、11434、8000、30000），找到就直接用；都没有才下载 hy-mt 1.8B（Q4_K_M，约 1.1 GB）与 llama.cpp。文件放在插件自己的数据目录，不进 npm 包，卸载插件后可手动删除。'),
-          ),
-          h(
-            'div',
-            { className: 'dpa-engine' },
-            h('div', { className: 'dpa-engine-head' }, '译文'),
-            h(
-              'div',
-              { className: 'dpa-engine-fields' },
-              h('label', null, h('span', null, '语言'), h('select', {
-                value: engineForm.targetLang,
-                onChange: (event) => saveEngine({ targetLang: event.target.value }),
-              }, LANGS.map(([value, label]) => h('option', { key: value, value }, label)))),
-            ),
-            engineForm.engine !== 'api'
-              ? h(
-                  'div',
-                  { className: 'dpa-theme-row', role: 'group', 'aria-label': '推理强度' },
-                  REASONING.map(([value, label]) => h('button', {
-                    key: value,
-                    type: 'button',
-                    'aria-pressed': engineForm.reasoning === value ? 'true' : 'false',
-                    onClick: () => saveEngine({ reasoning: value }),
-                  }, label)),
-                )
-              : null,
-            h('div', { className: 'dpa-engine-hint' }, engineForm.engine === 'api'
-              ? '自定义 API 的推理档位由对端模型自己决定，这里不生效。'
-              : '「自动」沿用插件配置里的 translateReasoning；模型不支持时会在没出字前退回不带该参数。'),
+            advancedSettings,
           ),
           h('button', {
             type: 'button',
