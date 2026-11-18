@@ -14,7 +14,7 @@
 // and the browser does the rest. Toggling changes that chat's system prompt
 // once, at the toggle; the cached prompt prefix is unaffected otherwise.
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -167,10 +167,37 @@ export function createModeStore(file = join(process.env.DSH_HOME ?? join(homedir
       }
     } catch { /* not there: try the next, or start fresh */ }
   }
+  // Every save leaves one line behind. Settings live in a single global file, so
+  // when an engine "changes back by itself" this log is the only way to see what
+  // was written, when, and with which fields — without it the only evidence is
+  // the current content, which no longer shows the previous value.
+  const logLimit = 64 * 1024;
+  const logSave = () => {
+    try {
+      const logFile = `${file}.log`;
+      const settings = state.translate ?? {};
+      appendFileSync(logFile, `${JSON.stringify({
+        at: new Date().toISOString(),
+        engine: settings.engine,
+        provider: settings.provider,
+        model: settings.model,
+        baseURL: settings.baseURL,
+        apiKey: settings.apiKey ? 'set' : '',
+        targetLang: settings.targetLang,
+        reasoning: settings.reasoning,
+        localAutoStart: settings.localAutoStart === true,
+      })}\n`);
+      if (statSync(logFile).size > logLimit) {
+        const kept = readFileSync(logFile, 'utf8').split('\n').filter(Boolean).slice(-200).join('\n');
+        writeFileSync(logFile, kept ? `${kept}\n` : '');
+      }
+    } catch { /* logging must never break a save */ }
+  };
   const persist = () => {
     try {
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, JSON.stringify(state, null, 2));
+      logSave();
     } catch { /* the change still holds for this run */ }
   };
   return {
@@ -207,6 +234,14 @@ export const MAX_TRANSLATE_CHARS = 6000;
 
 /** 同选区缓存的上限（条）；只存已成功、非空的译文。 */
 export const TRANSLATE_CACHE_MAX = 48;
+
+/** 已经拒绝过某个 reasoningEffort 的 provider/model（键：provider/model/effort）。 */
+const effortRejected = new Set();
+
+/** 测试共用一个进程：允许清掉上一条用例教给模块的记忆。 */
+export function resetEffortMemory() {
+  effortRejected.clear();
+}
 
 /**
  * 一次翻译的 token 上限。不要把 4096 无条件塞给每个短句：有些适配器会按上限
@@ -392,8 +427,12 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
     return { emitted, finishReason };
   };
   const effort = reasoningEffort === false ? '' : String(reasoningEffort ?? 'off').trim();
+  const effortKey = `${selection?.provider ?? ''}/${selection?.model ?? ''}/${effort}`;
   let firstFailed = false;
-  if (effort) {
+  // A provider that was asked once and refused this effort will refuse it again:
+  // skipping the doomed request saves one round trip on every later translation,
+  // and keeps a transient failure from being doubled (see the retry below).
+  if (effort && !effortRejected.has(effortKey)) {
     try {
       await run({ reasoningEffort: effort });
       firstFailed = !emitted && finishReason === 'error';
@@ -401,13 +440,24 @@ export async function translateText(llm, selection, text, { maxChars = MAX_TRANS
       if (emitted || !isUnsupportedReasoningEffort(error)) throw error;
       firstFailed = true;
     }
-    if (firstFailed) reset();
+    if (firstFailed) {
+      effortRejected.add(effortKey);
+      reset();
+    }
+  } else if (effort) {
+    firstFailed = true;
   }
   if (firstFailed || !effort) {
     await runClean({ maxTokens: Math.max(budget, 2048) });
   }
   if (!emitted && !failure && /max[-_]?tokens|length/i.test(finishReason)) {
     await runClean({ maxTokens: Math.min(8192, Math.max(budget, 2048) * 2) });
+  }
+  // A bare `finish(reason: 'error')` with nothing emitted is usually the provider
+  // failing one request, not the model refusing the task: one more try with the
+  // same budget turns most of these into a normal answer instead of an error card.
+  if (!emitted && !failure && finishReason === 'error') {
+    await runClean({ maxTokens: Math.max(budget, 2048) });
   }
 
 

@@ -5,7 +5,10 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { translateText, translatePrompt, pickSelection, MAX_TRANSLATE_CHARS, translationMaxTokens, splitParagraphs, groupParagraphs, translateCacheKey, isUnsupportedReasoningEffort } from '../src/index.js';
+import { translateText, translatePrompt, pickSelection, MAX_TRANSLATE_CHARS, translationMaxTokens, splitParagraphs, groupParagraphs, translateCacheKey, isUnsupportedReasoningEffort, resetEffortMemory } from '../src/index.js';
+
+// 模块会记住「这个 provider 拒绝过的 effort」；每条用例从干净状态开始。
+test.beforeEach(() => resetEffortMemory());
 
 /** A fake llm service whose stream yields the given chunks. */
 function fakeLlm(chunks) {
@@ -241,4 +244,54 @@ test('translateReasoning: false skips the probe entirely', async () => {
   const out = await translateText(llm, selection, 'x', { reasoningEffort: false });
   assert.equal(calls, 1);
   assert.equal(out.translation, '直接译。');
+});
+
+test('a bare finish(reason: error) with nothing emitted is retried once before failing', async () => {
+  let calls = 0;
+  const llm = {
+    stream() {
+      calls += 1;
+      if (calls === 1) {
+        return (async function* () {
+          yield { type: 'usage', inputTokens: 10 };
+          yield { type: 'finish', reason: 'error' };
+        })();
+      }
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: '第二次就正常了。' };
+        yield { type: 'finish', reason: 'stop' };
+      })();
+    },
+  };
+  // reasoningEffort: false -> 不走 effort 探测，直接测「纯 error 重试一次」。
+  const out = await translateText(llm, selection, 'x', { reasoningEffort: false });
+  assert.equal(calls, 2);
+  assert.equal(out.translation, '第二次就正常了。');
+  assert.equal(out.finishReason, 'stop');
+});
+
+test('an effort the provider turned down is not probed again on the next translation', async () => {
+  const picked = { provider: 'test-memo', model: 'model-that-lacks-off' };
+  let calls = 0;
+  const seen = [];
+  const llm = {
+    stream(options) {
+      calls += 1;
+      seen.push(options.reasoningEffort ?? null);
+      if (options.reasoningEffort !== undefined) {
+        return (async function* () {
+          yield { type: 'finish', reason: 'error' };
+        })();
+      }
+      return (async function* () {
+        yield { type: 'text-delta', index: 0, text: '译文。' };
+        yield { type: 'finish', reason: 'stop' };
+      })();
+    },
+  };
+  await translateText(llm, picked, 'first');
+  assert.deepEqual(seen, ['off', null], '第一次先探测，再用不带 effort 的重试');
+  await translateText(llm, picked, 'second');
+  assert.deepEqual(seen, ['off', null, null], '第二次直接走不带 effort 的调用');
+  assert.equal(calls, 3);
 });

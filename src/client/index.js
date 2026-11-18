@@ -380,6 +380,8 @@ function PdfAskBody(props) {
   const [engineForm, setEngineForm] = useState(DEFAULT_ENGINE_FORM);
   const [engineBusy, setEngineBusy] = useState(false);
   const [engineNote, setEngineNote] = useState('');
+  /** 服务端的设置真的读回来了吗？没读回来时不允许「保存」，否则会把默认值写回去。 */
+  const [engineReady, setEngineReady] = useState(false);
   /** 这次翻译实际会用哪个 provider/model（服务端算好给界面看）。 */
   const [resolved, setResolved] = useState(null);
   /** 页内查找：输入串、命中列表（null = 还没查过）、当前第几处、是否在查。 */
@@ -413,6 +415,7 @@ function PdfAskBody(props) {
         if (data?.translate) {
           setEngine(data.translate);
           setEngineForm({ ...data.translate, apiKey: '' });
+          setEngineReady(true);
         }
         setResolved(data?.resolved ?? null);
       })
@@ -980,6 +983,7 @@ function PdfAskBody(props) {
       }
       setEngine(data.translate);
       setResolved(data.resolved ?? null);
+      setEngineReady(true);
       // 全量保存后以服务端为准；离散改动则保留正在编辑的文本框内容。
       if (!isPatch) setEngineForm({ ...data.translate, apiKey: '' });
       setEngineNote('已保存');
@@ -1000,6 +1004,7 @@ function PdfAskBody(props) {
       setEngine(data.translate);
       setEngineForm({ ...data.translate, apiKey: '' });
       setResolved(data.resolved ?? null);
+      setEngineReady(true);
     } catch { /* 拉不到就用手里的旧值 */ }
   };
 
@@ -1494,7 +1499,8 @@ function PdfAskBody(props) {
               h('button', {
                 type: 'button',
                 className: 'dpa-btn',
-                disabled: engineBusy,
+                disabled: engineBusy || !engineReady,
+                title: engineReady ? '' : '还没从服务端读回已保存的设置，先点开面板重新拉一次',
                 onClick: () => saveEngine(),
               }, engineBusy ? '保存中…' : '保存引擎设置'),
               engine.engine === 'api' && engine.hasKey
