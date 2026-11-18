@@ -22,6 +22,16 @@ import { addMark, MARK_COLORS, pdfExists, readMarks, removeMark, resolvePdfPath,
 import { translateViaApi } from './api.js';
 import { createLocalRunner, isLocalBaseURL } from './local.js';
 import { promptsForConfig } from './prompts.js';
+import {
+  cancelLocalDownload,
+  localDownloadState,
+  localModelDir,
+  presetFor,
+  probeLocalServers,
+  readLocalFiles,
+  startLocalDownload,
+  writeStartScript,
+} from './setup.js';
 
 export const name = 'dsh-paper-lens';
 export const inject = [];
@@ -809,17 +819,81 @@ export function apply(ctx, config = {}) {
     },
   });
 
+  // 本地模型：先找用户已经跑着的，找不到再帮他下载一个。
+  //   GET                                  → { dir, files, download }
+  //   POST { action:'probe' }              → { hits, preset }（扫常见端口）
+  //   POST { action:'preset', hits? }      → { preset }（按磁盘上已有的文件算设置）
+  //   POST { action:'download' }           → 202 { download }（后台下载，轮询 GET 看进度）
+  //   POST { action:'cancel' }             → { download }
+  //   POST { action:'write-script' }       → { preset, files }（已有 server+model 时重写启动脚本）
+  const localRoute = (web) => web.register({
+    kind: 'exact',
+    path: `${BASE}/local`,
+    handler: async (req = {}, res) => {
+      const method = (req.method || 'GET').toUpperCase();
+      const dir = localModelDir();
+      // 文件都齐了但缺启动脚本时顺手补一份：预设里就能直接带上命令。
+      const presetWithScript = (hits = []) => {
+        let files = readLocalFiles(dir);
+        if (files.server.ok && files.model.ok && !files.script.ok) {
+          try {
+            writeStartScript(dir, files);
+            files = readLocalFiles(dir);
+          } catch { /* 目录只读时保持原样，让用户看到缺什么 */ }
+        }
+        return { files, preset: presetFor({ files, hits }) };
+      };
+      if (method === 'GET') {
+        return sendJson(res, 200, { dir, files: readLocalFiles(dir), download: localDownloadState() });
+      }
+      if (method !== 'POST') return sendJson(res, 405, { error: '只支持 GET/POST' });
+      const body = await readJson(req, 8 * 1024);
+      const action = typeof body?.action === 'string' ? body.action : '';
+      if (action === 'probe') {
+        const hits = await probeLocalServers();
+        const { files, preset } = presetWithScript(hits);
+        return sendJson(res, 200, { hits, files, preset });
+      }
+      if (action === 'preset') {
+        const hits = Array.isArray(body?.hits) ? body.hits.filter((hit) => hit && typeof hit.baseURL === 'string') : [];
+        const { files, preset } = presetWithScript(hits);
+        return sendJson(res, 200, { files, preset });
+      }
+      if (action === 'download') {
+        // 后台跑，HTTP 只回当前进度；面板轮询 GET 看百分比。
+        startLocalDownload({ dir }).catch(() => {});
+        return sendJson(res, 202, { download: localDownloadState() });
+      }
+      if (action === 'cancel') {
+        cancelLocalDownload();
+        return sendJson(res, 200, { download: localDownloadState() });
+      }
+      if (action === 'write-script') {
+        const files = readLocalFiles(dir);
+        if (!files.server.ok || !files.model.ok) {
+          return sendJson(res, 400, { error: '还没找到 llama-server 或模型文件，先下载或手动放好再试' });
+        }
+        const scriptPath = writeStartScript(dir, files);
+        files.script = { path: scriptPath, ok: true };
+        return sendJson(res, 200, { files, preset: presetFor({ files, hits: [] }) });
+      }
+      return sendJson(res, 400, { error: 'action 只能是 probe/preset/download/cancel/write-script' });
+    },
+  });
+
   if (config.routes !== false) {
     if (typeof ctx.inject === 'function') {
       ctx.inject(['webServer'], (scope) => {
         scope.effect(() => configRoute(scope.webServer), 'dsh-paper-lens: config route');
         scope.effect(() => marksRoute(scope.webServer), 'dsh-paper-lens: marks route');
+        scope.effect(() => localRoute(scope.webServer), 'dsh-paper-lens: local model route');
       });
     } else {
       const web = service(ctx, 'webServer');
       if (web?.register) {
         ctx.effect?.(() => configRoute(web), 'dsh-paper-lens: config route');
         ctx.effect?.(() => marksRoute(web), 'dsh-paper-lens: marks route');
+        ctx.effect?.(() => localRoute(web), 'dsh-paper-lens: local model route');
       }
     }
   }

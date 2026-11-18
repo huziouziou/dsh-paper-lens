@@ -185,6 +185,7 @@ const CSS = [
   '.dpa-engine-actions{display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap}',
   '.dpa-engine-note{font-size:11px;opacity:.8}',
   '.dpa-engine-hint{font-size:11px;opacity:.65;margin-top:6px;line-height:1.5}',
+  '.dpa-local-status{font-size:11px;opacity:.8;margin-bottom:6px;line-height:1.5;word-break:break-all}',
   '.dpa-resolved{font-size:11px;opacity:.85;margin:-2px 0 6px;line-height:1.5;word-break:break-word}',
   '.dpa-check{display:flex;align-items:center;gap:6px;font-size:12px;opacity:.9;margin-top:2px}',
   '.dpa-check input{flex:none;margin:0}',
@@ -384,6 +385,12 @@ function PdfAskBody(props) {
   const [engineReady, setEngineReady] = useState(false);
   /** 这次翻译实际会用哪个 provider/model（服务端算好给界面看）。 */
   const [resolved, setResolved] = useState(null);
+  /** 本地模型：目录、磁盘上已有的文件、下载进度、提示文案。 */
+  const [localFiles, setLocalFiles] = useState(null);
+  const [localDir, setLocalDir] = useState('');
+  const [localJob, setLocalJob] = useState(null);
+  const [localBusy, setLocalBusy] = useState(false);
+  const [localNote, setLocalNote] = useState('');
   /** 页内查找：输入串、命中列表（null = 还没查过）、当前第几处、是否在查。 */
   const [findQuery, setFindQuery] = useState('');
   const [findHits, setFindHits] = useState(null);
@@ -422,6 +429,39 @@ function PdfAskBody(props) {
       .catch(() => { /* built-in presets */ });
     return () => { cancelled = true; };
   }, []);
+
+  // 本地模型下载：面板开着时每秒看一次进度，完成后自动把预设写进设置。
+  useEffect(() => {
+    if (!settingsOpen) return undefined;
+    const phase = localJob?.phase;
+    if (phase !== 'model' && phase !== 'server' && phase !== 'unpack') return undefined;
+    let stop = false;
+    const tick = async () => {
+      const response = await fetch(`${PLUGIN_BASE}/local`).catch(() => null);
+      const data = response?.ok ? await response.json().catch(() => null) : null;
+      if (stop || !data) return;
+      setLocalFiles(data.files ?? null);
+      setLocalJob(data.download ?? null);
+      const next = data.download?.phase;
+      if (next === 'done') {
+        setLocalNote(data.download.message ?? '下载完成');
+        const presetResponse = await fetch(`${PLUGIN_BASE}/local`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action: 'preset' }),
+        }).catch(() => null);
+        const presetData = presetResponse?.ok ? await presetResponse.json().catch(() => null) : null;
+        if (!stop && presetData?.preset?.ready) await applyLocalPreset(presetData.preset);
+      } else if (next === 'error') {
+        setLocalNote(data.download?.error || '下载失败');
+      }
+    };
+    const timer = setInterval(tick, 1000);
+    return () => {
+      stop = true;
+      clearInterval(timer);
+    };
+  }, [settingsOpen, localJob?.phase]);
 
   // Open (or re-open after the file changes) the document.
   useEffect(() => {
@@ -1034,8 +1074,131 @@ function PdfAskBody(props) {
     }
   };
 
+  /** 读一次本地模型状态：插件数据目录、磁盘上已有的文件、下载进度。 */
+  const readLocal = async () => {
+    try {
+      const response = await fetch(`${PLUGIN_BASE}/local`);
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data) return null;
+      setLocalFiles(data.files ?? null);
+      setLocalDir(data.dir ?? '');
+      setLocalJob(data.download ?? null);
+      return data;
+    } catch {
+      return null;
+    }
+  };
+
+  const postLocal = async (action) => {
+    const response = await fetch(`${PLUGIN_BASE}/local`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(data?.error ?? `HTTP ${response.status}`);
+    return data;
+  };
+
+  /** 把服务端算好的预设写进设置；成功后表单也跟着刷新。 */
+  const applyLocalPreset = async (preset) => {
+    if (!preset?.ready) {
+      setLocalNote(preset?.note ?? '没有找到可用的本地模型');
+      return false;
+    }
+    setLocalBusy(true);
+    setLocalNote('');
+    try {
+      const response = await fetch(`${PLUGIN_BASE}/config`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          engine: 'api',
+          baseURL: preset.baseURL,
+          model: preset.model,
+          localCommand: preset.localCommand ?? '',
+          localAutoStart: preset.localAutoStart === true,
+        }),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        setEngineNote(data?.error ?? `保存失败（HTTP ${response.status}）`);
+        return false;
+      }
+      setEngine(data.translate);
+      setEngineForm({ ...data.translate, apiKey: '' });
+      setResolved(data.resolved ?? null);
+      setEngineReady(true);
+      setEngineNote('已切到本地模型');
+      setLocalNote(preset.note ?? '');
+      say('已切到本地模型（离线）');
+      return true;
+    } catch (error) {
+      setLocalNote(`保存失败：${error?.message ?? error}`);
+      return false;
+    } finally {
+      setLocalBusy(false);
+    }
+  };
+
+  /** 一键：本机已有在跑的本地服务就用它；已有下好的文件就写脚本；都没有再提示下载。 */
+  const useLocalModel = async () => {
+    setLocalBusy(true);
+    setLocalNote('');
+    try {
+      const data = await postLocal('probe');
+      if (data.preset?.ready) {
+        await applyLocalPreset(data.preset);
+        return;
+      }
+      setLocalNote(data.preset?.note ?? '没有找到本地模型服务');
+      await readLocal();
+    } catch (error) {
+      setLocalNote(`检测失败：${error?.message ?? error}`);
+    } finally {
+      setLocalBusy(false);
+    }
+  };
+
+  const downloadLocalModel = async () => {
+    setLocalBusy(true);
+    setLocalNote('');
+    try {
+      const data = await postLocal('download');
+      setLocalJob(data.download ?? null);
+      setLocalNote('开始下载，面板关掉也会继续。');
+    } catch (error) {
+      setLocalNote(`下载没能开始：${error?.message ?? error}`);
+    } finally {
+      setLocalBusy(false);
+    }
+  };
+
+  const cancelLocalModel = async () => {
+    try {
+      const data = await postLocal('cancel');
+      setLocalJob(data.download ?? null);
+      setLocalNote('已取消下载');
+    } catch (error) {
+      setLocalNote(`取消失败：${error?.message ?? error}`);
+    }
+  };
+
   const view = viewRef.current;
   const ready = status.phase === 'ready';
+  const localPhase = localJob?.phase ?? 'idle';
+  const localDownloading = localPhase === 'model' || localPhase === 'server' || localPhase === 'unpack';
+  const megabytes = (bytes) => (Number(bytes ?? 0) / 1024 / 1024).toFixed(0);
+  const localStatusText = (() => {
+    if (localPhase === 'model' || localPhase === 'server') {
+      const percent = localJob?.total ? Math.round((localJob.received / localJob.total) * 100) : 0;
+      return `${localJob?.message ?? '下载中'} ${percent}%（${megabytes(localJob?.received)} / ${localJob?.total ? megabytes(localJob.total) : '?'} MB）`;
+    }
+    if (localPhase === 'unpack') return localJob?.message || '解压中…';
+    if (localFiles?.server?.ok && localFiles?.model?.ok) return `已在本机准备好（${localDir}）`;
+    if (localFiles?.model?.ok) return '模型已下载，还缺 llama-server';
+    return '还没准备：可以先找本机已有的服务，或下载一份（约 1.1 GB）。';
+  })();
   /** 跳到输入框里的页码；超出总页数时夹到最后一页，并把输入框改回真实页码。 */
   const goToPage = (raw) => {
     const target = Math.floor(Number(raw));
@@ -1161,7 +1324,7 @@ function PdfAskBody(props) {
       note ? h('span', { className: `dpa-note${note.error ? ' dpa-err' : ''}`, title: note.text }, note.text) : h('span', { className: 'dpa-note' }, '选中文字即可翻译、引用或提问'),
       h('span', { className: 'dpa-spacer' }),
       h('button', { type: 'button', className: 'dpa-btn', title: '查看/删除本 PDF 的批注', onClick: () => { setMarksOpen((v) => !v); setSettingsOpen(false); setMarkDetail(null); } }, marks.length ? `批注 ${marks.length}` : '批注'),
-      h('button', { type: 'button', className: 'dpa-btn', title: '字号与气泡宽度', onClick: () => { const next = !settingsOpen; setSettingsOpen(next); setMarksOpen(false); if (next) { setEngineNote(''); refreshEngine(); } } }, '设置'),
+      h('button', { type: 'button', className: 'dpa-btn', title: '字号与气泡宽度', onClick: () => { const next = !settingsOpen; setSettingsOpen(next); setMarksOpen(false); if (next) { setEngineNote(''); setLocalNote(''); refreshEngine(); readLocal(); } } }, '设置'),
       h('button', { type: 'button', className: 'dpa-btn', title: '缩小', disabled: !ready, onClick: () => zoom(-1) }, '−'),
       h('span', { style: { minWidth: '38px', textAlign: 'center' } }, zoomLabel),
       h('button', { type: 'button', className: 'dpa-btn', title: '放大', disabled: !ready, onClick: () => zoom(1) }, '+'),
@@ -1518,6 +1681,36 @@ function PdfAskBody(props) {
               : engineForm.engine === 'model'
                 ? '仍走宿主模型服务（凭据、代理都在宿主里），只换 provider/model；三种引擎互斥，只按这一种走。'
                 : '直连 OpenAI 兼容的 /chat/completions；key 只保存在本机的 dsh-paper-lens.json 里。指向 127.0.0.1/localhost 时，填「启动命令」可让插件按需拉起，空闲十分钟后关掉。'),
+          ),
+          h(
+            'div',
+            { className: 'dpa-engine dpa-local' },
+            h('div', { className: 'dpa-engine-head' }, '本地模型（离线）'),
+            h('div', { className: 'dpa-local-status' }, localStatusText),
+            h(
+              'div',
+              { className: 'dpa-engine-actions' },
+              h('button', {
+                type: 'button',
+                className: 'dpa-btn',
+                disabled: localBusy || localDownloading,
+                onClick: useLocalModel,
+              }, localBusy ? '检测中…' : '使用本地模型（离线）'),
+              localDownloading
+                ? h('button', {
+                    type: 'button',
+                    className: 'dpa-small',
+                    onClick: cancelLocalModel,
+                  }, '取消下载')
+                : h('button', {
+                    type: 'button',
+                    className: 'dpa-small',
+                    disabled: localBusy,
+                    onClick: downloadLocalModel,
+                  }, localFiles?.model?.ok ? '补下 llama.cpp（约 24 MB）' : '下载模型与 llama.cpp（约 1.1 GB）'),
+            ),
+            localNote ? h('div', { className: 'dpa-engine-note' }, localNote) : null,
+            h('div', { className: 'dpa-engine-hint' }, '先找本机已经在跑的 LM Studio / Ollama / llama.cpp（8080、1234、11434、8000、30000），找到就直接用；都没有才下载 hy-mt 1.8B（Q4_K_M，约 1.1 GB）与 llama.cpp。文件放在插件自己的数据目录，不进 npm 包，卸载插件后可手动删除。'),
           ),
           h(
             'div',
