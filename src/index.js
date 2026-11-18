@@ -129,15 +129,27 @@ export function normalizeTargetLang(value) {
   return LANG_LABELS.has(lang) ? lang : DEFAULT_TARGET_LANG;
 }
 
-/** The stored shape; anything malformed falls back to following the chat. */
+/**
+ * The stored shape; anything malformed falls back to following the chat.
+ *
+ * 「指定模型」和「自定义 API」各存自己的一份 provider/model —— 它们本来是两种
+ * 互不相干的选择，共用一个 `model` 字段时，保存其中一个会把另一个的模型名改掉。
+ */
 export function normalizeTranslateSettings(raw) {
   const src = raw && typeof raw === 'object' ? raw : {};
   const text = (value) => (typeof value === 'string' ? value.trim() : '');
+  const engine = TRANSLATE_ENGINES.includes(src.engine) ? src.engine : 'session';
+  // Files written before 0.5.5 keep one provider/model/baseURL. Which engine that
+  // model belonged to follows the active engine first, then the URL: an API
+  // endpoint with no pinned engine means the model was the API model.
+  const legacy = text(src.model);
+  const legacyApi = engine === 'model' ? false : Boolean(text(src.apiBaseURL) || text(src.baseURL));
   return {
-    engine: TRANSLATE_ENGINES.includes(src.engine) ? src.engine : 'session',
-    provider: text(src.provider),
-    model: text(src.model),
-    baseURL: text(src.baseURL),
+    engine,
+    modelProvider: text(src.modelProvider) || text(src.provider),
+    modelName: text(src.modelName) || (legacyApi ? '' : legacy),
+    apiBaseURL: text(src.apiBaseURL) || text(src.baseURL),
+    apiModel: text(src.apiModel) || (legacyApi ? legacy : ''),
     apiKey: typeof src.apiKey === 'string' ? src.apiKey : '',
     targetLang: normalizeTargetLang(src.targetLang),
     reasoning: REASONING_LEVELS.includes(src.reasoning) ? src.reasoning : 'auto',
@@ -152,9 +164,10 @@ export function publicTranslateSettings(settings) {
   const safe = normalizeTranslateSettings(settings);
   return {
     engine: safe.engine,
-    provider: safe.provider,
-    model: safe.model,
-    baseURL: safe.baseURL,
+    modelProvider: safe.modelProvider,
+    modelName: safe.modelName,
+    apiBaseURL: safe.apiBaseURL,
+    apiModel: safe.apiModel,
     hasKey: Boolean(safe.apiKey),
     targetLang: safe.targetLang,
     reasoning: safe.reasoning,
@@ -189,9 +202,10 @@ export function createModeStore(file = join(process.env.DSH_HOME ?? join(homedir
       appendFileSync(logFile, `${JSON.stringify({
         at: new Date().toISOString(),
         engine: settings.engine,
-        provider: settings.provider,
-        model: settings.model,
-        baseURL: settings.baseURL,
+        modelProvider: settings.modelProvider,
+        modelName: settings.modelName,
+        apiBaseURL: settings.apiBaseURL,
+        apiModel: settings.apiModel,
         apiKey: settings.apiKey ? 'set' : '',
         targetLang: settings.targetLang,
         reasoning: settings.reasoning,
@@ -342,16 +356,16 @@ export function describeTranslateRoute(scope, settings) {
   if (engine === 'model') {
     return {
       engine,
-      provider: settings.provider,
-      model: settings.model,
-      label: `${settings.provider} / ${settings.model}`,
+      provider: settings.modelProvider,
+      model: settings.modelName,
+      label: `${settings.modelProvider} / ${settings.modelName}`,
     };
   }
   if (engine === 'api') {
-    const local = isLocalBaseURL(settings.baseURL);
-    const where = settings.baseURL || '（还没填接口地址）';
-    const model = settings.model || '（还没填模型名）';
-    return { engine, baseURL: settings.baseURL, model: settings.model, local, label: `${model} @ ${where}${local ? '（本地）' : ''}` };
+    const local = isLocalBaseURL(settings.apiBaseURL);
+    const where = settings.apiBaseURL || '（还没填接口地址）';
+    const model = settings.apiModel || '（还没填模型名）';
+    return { engine, baseURL: settings.apiBaseURL, model: settings.apiModel, local, label: `${model} @ ${where}${local ? '（本地）' : ''}` };
   }
   const selection = pickSelection(scope);
   return {
@@ -694,8 +708,9 @@ export function apply(ctx, config = {}) {
   }
 
   // 客户端读预设提示词、批注颜色与翻译引擎设置。
-  //   GET  → { prompts, markColors, translate }（translate 里不含 apiKey）
-  //   POST { engine?, provider?, model?, baseURL?, apiKey? } → { translate }
+  //   GET  → { prompts, markColors, translate, resolved }（translate 里不含 apiKey）
+  //   POST { engine?, modelProvider?, modelName?, apiBaseURL?, apiModel?, apiKey?, … } → { translate, resolved }
+  // 两套模型字段各自独立：保存一套不会动另一套。
   // apiKey 省略=保持不变；空串=清除。
   const configRoute = (web) => web.register({
     kind: 'exact',
@@ -719,11 +734,22 @@ export function apply(ctx, config = {}) {
         if (!TRANSLATE_ENGINES.includes(body.engine)) return sendJson(res, 400, { error: 'engine 只能是 session/model/api' });
         patch.engine = body.engine;
       }
-      for (const key of ['provider', 'model', 'baseURL']) {
-        if (key in body) {
-          if (typeof body[key] !== 'string') return sendJson(res, 400, { error: `${key} 必须是字符串` });
-          patch[key] = body[key];
-        }
+      for (const key of ['modelProvider', 'modelName', 'apiBaseURL', 'apiModel']) {
+        if (!(key in body)) continue;
+        if (typeof body[key] !== 'string') return sendJson(res, 400, { error: `${key} 必须是字符串` });
+        patch[key] = body[key];
+      }
+      // 0.5.4 及更早的调用方只有一组字段名，这里继续认。
+      for (const [oldKey, newKey] of [['provider', 'modelProvider'], ['baseURL', 'apiBaseURL']]) {
+        if (!(oldKey in body)) continue;
+        if (typeof body[oldKey] !== 'string') return sendJson(res, 400, { error: `${oldKey} 必须是字符串` });
+        if (!(newKey in patch)) patch[newKey] = body[oldKey];
+      }
+      if ('model' in body) {
+        if (typeof body.model !== 'string') return sendJson(res, 400, { error: 'model 必须是字符串' });
+        // 旧的单个 model 归到当前引擎这一套，除非调用方明确给了新字段名。
+        const engine = patch.engine ?? modes.translate().engine;
+        if (!('modelName' in body) && !('apiModel' in body)) patch[engine === 'api' ? 'apiModel' : 'modelName'] = body.model;
       }
       if ('apiKey' in body) {
         if (typeof body.apiKey !== 'string') return sendJson(res, 400, { error: 'apiKey 必须是字符串' });
@@ -746,12 +772,10 @@ export function apply(ctx, config = {}) {
         patch.reasoning = body.reasoning;
       }
       const merged = normalizeTranslateSettings({ ...modes.translate(), ...patch });
-      if (merged.engine === 'model' && (!merged.provider || !merged.model)) {
-        return sendJson(res, 400, { error: '指定模型需要同时填 provider 和 model' });
-      }
-      if (merged.engine === 'api') {
-        if (!/^https?:\/\//i.test(merged.baseURL)) return sendJson(res, 400, { error: '自定义 API 的地址要以 http:// 或 https:// 开头' });
-        if (!merged.model) return sendJson(res, 400, { error: '自定义 API 需要模型名' });
+      // 允许先把不完整的一套存下来：面板切换引擎时，另一套字段可能还是空的。
+      // 真到要翻译时，由翻译路由给出「还没填 provider / 模型名」这类具体提示。
+      if (merged.apiBaseURL && !/^https?:\/\//i.test(merged.apiBaseURL)) {
+        return sendJson(res, 400, { error: '自定义 API 的地址要以 http:// 或 https:// 开头' });
       }
       const saved = modes.saveTranslate(merged);
       return sendJson(res, 200, { translate: publicTranslateSettings(saved), resolved: describeTranslateRoute(ctx, saved) });
@@ -921,10 +945,10 @@ export function apply(ctx, config = {}) {
       // 三种引擎互斥：只按当前选中的一种走。字段没填完就明确报错，
       // 不再悄悄回落到会话模型——那会让「我明明选了本地，怎么走云端」变得无法解释。
       if (settings.engine === 'api') {
-        if (!/^https?:\/\//i.test(settings.baseURL)) return sendJson(res, 400, { error: '「自定义 API」还没填接口地址（http:// 或 https://）' });
-        if (!settings.model) return sendJson(res, 400, { error: '「自定义 API」还没填模型名' });
+        if (!/^https?:\/\//i.test(settings.apiBaseURL)) return sendJson(res, 400, { error: '「自定义 API」还没填接口地址（http:// 或 https://）' });
+        if (!settings.apiModel) return sendJson(res, 400, { error: '「自定义 API」还没填模型名' });
       }
-      if (settings.engine === 'model' && (!settings.provider || !settings.model)) {
+      if (settings.engine === 'model' && (!settings.modelProvider || !settings.modelName)) {
         return sendJson(res, 400, { error: '「指定模型」需要同时填 provider 和 model' });
       }
       const usingApi = settings.engine === 'api';
@@ -933,7 +957,7 @@ export function apply(ctx, config = {}) {
       let selection = null;
       if (settings.engine === 'model') {
         // 显式指定模型：仍然走宿主 llm（因此凭证/代理/审计都在宿主里），只是换 provider/model。
-        selection = { provider: settings.provider, model: settings.model };
+        selection = { provider: settings.modelProvider, model: settings.modelName };
       } else if (!usingApi) {
         // 否则问「这个会话实际路由到哪个模型」——和官方压缩调用同源（agent.session.requestHeader().config），
         // 它一定带着可用的凭据；应用默认值只作兜底。
@@ -947,9 +971,9 @@ export function apply(ctx, config = {}) {
         }
       }
       // 自定义 API 指向本机时，允许插件替用户把服务拉起来（命令是用户自己填的）。
-      if (usingApi && isLocalBaseURL(settings.baseURL)) {
+      if (usingApi && isLocalBaseURL(settings.apiBaseURL)) {
         const local = await localRunner.ensure({
-          baseURL: settings.baseURL,
+          baseURL: settings.apiBaseURL,
           command: settings.localCommand,
           autoStart: settings.localAutoStart,
         });
@@ -959,7 +983,7 @@ export function apply(ctx, config = {}) {
           });
         }
       }
-      const identity = usingApi ? { provider: `api:${settings.baseURL}`, model: settings.model } : selection;
+      const identity = usingApi ? { provider: `api:${settings.apiBaseURL}`, model: settings.apiModel } : selection;
       // 「指定模型」留一条退路：上游 503/超时时改用本会话实际路由的模型，让「翻译失败」
       // 退化成「慢一点但出得来」。自定义 API 的失败是地址/服务问题，换模型没有意义。
       let fallbackSelection = null;
@@ -1008,9 +1032,9 @@ export function apply(ctx, config = {}) {
         const maxTokens = translationMaxTokens(part);
         if (usingApi) {
           return translateViaApi({
-            baseURL: settings.baseURL,
+            baseURL: settings.apiBaseURL,
             apiKey: settings.apiKey,
-            model: settings.model,
+            model: settings.apiModel,
             text: part,
             maxTokens,
             targetLang,

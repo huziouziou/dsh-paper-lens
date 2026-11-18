@@ -25,9 +25,13 @@ const { useEffect, useRef, useState, useCallback } = React;
 export const PREVIEW_ID = 'dsh-paper-lens/pdf';
 /** 服务端的插件路由根（与 src/index.js 的 BASE 必须一致）。 */
 const PLUGIN_BASE = '/plugin-data/dsh-paper-lens';
-/** 翻译引擎设置的客户端默认值；真实值从 /config 来。 */
-const DEFAULT_ENGINE = { engine: 'session', provider: '', model: '', baseURL: '', hasKey: false, targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false };
-const DEFAULT_ENGINE_FORM = { engine: 'session', provider: '', model: '', baseURL: '', apiKey: '', targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false };
+/**
+ * 翻译引擎设置的客户端默认值；真实值从 /config 来。
+ * 两套模型字段各自独立：「指定模型」用 modelProvider/modelName，「自定义 API」
+ * 用 apiBaseURL/apiModel —— 保存一套不会把另一套的模型名改掉。
+ */
+const DEFAULT_ENGINE = { engine: 'session', modelProvider: '', modelName: '', apiBaseURL: '', apiModel: '', hasKey: false, targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false };
+const DEFAULT_ENGINE_FORM = { engine: 'session', modelProvider: '', modelName: '', apiBaseURL: '', apiModel: '', apiKey: '', targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false };
 const LANGS = [
   ['zh-Hans', '简体中文'],
   ['zh-Hant', '繁體中文'],
@@ -1009,9 +1013,10 @@ function PdfAskBody(props) {
         ? { ...patch }
         : {
             engine: form.engine,
-            provider: form.provider,
-            model: form.model,
-            baseURL: form.baseURL,
+            modelProvider: form.modelProvider,
+            modelName: form.modelName,
+            apiBaseURL: form.apiBaseURL,
+            apiModel: form.apiModel,
             targetLang: form.targetLang,
             reasoning: form.reasoning,
             localCommand: form.localCommand,
@@ -1121,8 +1126,8 @@ function PdfAskBody(props) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           engine: 'api',
-          baseURL: preset.baseURL,
-          model: preset.model,
+          apiBaseURL: preset.baseURL,
+          apiModel: preset.model,
           localCommand: preset.localCommand ?? '',
           localAutoStart: preset.localAutoStart === true,
         }),
@@ -1220,14 +1225,14 @@ function PdfAskBody(props) {
               'div',
               { className: 'dpa-engine-fields' },
               h('label', null, h('span', null, 'provider'), h('input', {
-                value: engineForm.provider,
+                value: engineForm.modelProvider,
                 placeholder: 'opencode-go',
-                onChange: (event) => { setEngineForm((form) => ({ ...form, provider: event.target.value })); markDirtyField(); },
+                onChange: (event) => { setEngineForm((form) => ({ ...form, modelProvider: event.target.value })); markDirtyField(); },
               })),
               h('label', null, h('span', null, 'model'), h('input', {
-                value: engineForm.model,
+                value: engineForm.modelName,
                 placeholder: 'claude-haiku-5-5',
-                onChange: (event) => { setEngineForm((form) => ({ ...form, model: event.target.value })); markDirtyField(); },
+                onChange: (event) => { setEngineForm((form) => ({ ...form, modelName: event.target.value })); markDirtyField(); },
               })),
             )
           : null,
@@ -1236,14 +1241,14 @@ function PdfAskBody(props) {
               'div',
               { className: 'dpa-engine-fields' },
               h('label', null, h('span', null, '接口地址'), h('input', {
-                value: engineForm.baseURL,
+                value: engineForm.apiBaseURL,
                 placeholder: 'https://api.example.com/v1',
-                onChange: (event) => { setEngineForm((form) => ({ ...form, baseURL: event.target.value })); markDirtyField(); },
+                onChange: (event) => { setEngineForm((form) => ({ ...form, apiBaseURL: event.target.value })); markDirtyField(); },
               })),
               h('label', null, h('span', null, '模型名'), h('input', {
-                value: engineForm.model,
+                value: engineForm.apiModel,
                 placeholder: 'gpt-4o-mini',
-                onChange: (event) => { setEngineForm((form) => ({ ...form, model: event.target.value })); markDirtyField(); },
+                onChange: (event) => { setEngineForm((form) => ({ ...form, apiModel: event.target.value })); markDirtyField(); },
               })),
               h('label', null, h('span', null, 'API key'), h('input', {
                 type: 'password',

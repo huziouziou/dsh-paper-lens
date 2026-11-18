@@ -62,22 +62,40 @@ async function call(handler, { method = 'GET', url = '/', body } = {}) {
 
 test('translate settings default to following the chat, and junk is ignored', () => {
   assert.deepEqual(normalizeTranslateSettings(null), {
-    engine: 'session', provider: '', model: '', baseURL: '', apiKey: '', targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false,
+    engine: 'session', modelProvider: '', modelName: '', apiBaseURL: '', apiModel: '', apiKey: '', targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false,
   });
   const kept = normalizeTranslateSettings({
-    engine: 'api', provider: ' p ', model: 'm', baseURL: ' https://x/v1 ', apiKey: 'k', targetLang: 'ja', reasoning: 'high', localCommand: ' D:\\start.bat ', localAutoStart: true,
+    engine: 'api', modelProvider: ' p ', modelName: ' n ', apiBaseURL: ' https://x/v1 ', apiModel: ' m ', apiKey: 'k', targetLang: 'ja', reasoning: 'high', localCommand: ' D:\\start.bat ', localAutoStart: true,
   });
-  assert.deepEqual(kept, { engine: 'api', provider: 'p', model: 'm', baseURL: 'https://x/v1', apiKey: 'k', targetLang: 'ja', reasoning: 'high', localCommand: 'D:\\start.bat', localAutoStart: true });
+  assert.deepEqual(kept, { engine: 'api', modelProvider: 'p', modelName: 'n', apiBaseURL: 'https://x/v1', apiModel: 'm', apiKey: 'k', targetLang: 'ja', reasoning: 'high', localCommand: 'D:\\start.bat', localAutoStart: true });
   assert.equal(normalizeTranslateSettings({ engine: 'nope', apiKey: 42 }).engine, 'session');
   assert.equal(normalizeTranslateSettings({ engine: 'nope', apiKey: 42 }).apiKey, '');
   assert.equal(normalizeTranslateSettings({ targetLang: 'klingon', reasoning: 'max' }).targetLang, 'zh-Hans');
   assert.equal(normalizeTranslateSettings({ targetLang: 'klingon', reasoning: 'max' }).reasoning, 'auto');
 });
 
+test('the two engines keep their own model, and an old single-model file is migrated', () => {
+  // 0.5.4 及更早只有 provider/model/baseURL：带地址的是 API 那一套，不带地址的是指定模型。
+  assert.deepEqual(
+    normalizeTranslateSettings({ engine: 'model', provider: 'opencode-go', model: 'deepseek-v4.1-flash' }),
+    { engine: 'model', modelProvider: 'opencode-go', modelName: 'deepseek-v4.1-flash', apiBaseURL: '', apiModel: '', apiKey: '', targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false },
+  );
+  assert.deepEqual(
+    normalizeTranslateSettings({ engine: 'api', baseURL: 'http://127.0.0.1:8080/v1', model: 'hy-mt' }),
+    { engine: 'api', modelProvider: '', modelName: '', apiBaseURL: 'http://127.0.0.1:8080/v1', apiModel: 'hy-mt', apiKey: '', targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false },
+  );
+  // 两套字段同时存在时各自保留，互不覆盖。
+  const both = normalizeTranslateSettings({
+    engine: 'model', modelProvider: 'opencode-go', modelName: 'claude-haiku-5-5', apiBaseURL: 'http://127.0.0.1:8080/v1', apiModel: 'hy-mt',
+  });
+  assert.equal(both.modelName, 'claude-haiku-5-5');
+  assert.equal(both.apiModel, 'hy-mt');
+});
+
 test('the public view never carries the key, only whether one is saved', () => {
-  const shown = publicTranslateSettings({ engine: 'api', baseURL: 'https://x', model: 'm', apiKey: 'secret' });
+  const shown = publicTranslateSettings({ engine: 'api', apiBaseURL: 'https://x', apiModel: 'm', apiKey: 'secret' });
   assert.deepEqual(shown, {
-    engine: 'api', provider: '', model: 'm', baseURL: 'https://x', hasKey: true, targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false,
+    engine: 'api', modelProvider: '', modelName: '', apiBaseURL: 'https://x', apiModel: 'm', hasKey: true, targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false,
   });
   assert.equal('apiKey' in shown, false);
 });
@@ -88,19 +106,27 @@ test('the config route saves the engine, hides the key, and keeps it when omitte
     const routes = harness(join(dir, 'state.json'));
     const route = routes[`${BASE}/config`];
 
-    const bad = await call(route, { method: 'POST', body: { engine: 'model', model: 'm' } });
-    assert.equal(bad.status, 400);
-    assert.match(bad.json.error, /provider/);
+    // 切到「指定模型」时字段可能还没填：允许先存下来，翻译时再报具体缺什么。
+    const partial = await call(route, { method: 'POST', body: { engine: 'model', model: 'm' } });
+    assert.equal(partial.status, 200);
+    assert.equal(partial.json.translate.engine, 'model');
+    assert.equal(partial.json.translate.modelName, 'm');
 
     const saved = await call(route, {
       method: 'POST',
-      body: { engine: 'api', baseURL: 'https://api.example.com/v1', model: 'fast', apiKey: 'sk-local' },
+      body: { engine: 'api', apiBaseURL: 'https://api.example.com/v1', apiModel: 'fast', apiKey: 'sk-local' },
     });
     assert.equal(saved.status, 200);
     assert.deepEqual(saved.json.translate, {
-      engine: 'api', provider: '', model: 'fast', baseURL: 'https://api.example.com/v1', hasKey: true, targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false,
+      engine: 'api', modelProvider: '', modelName: 'm', apiBaseURL: 'https://api.example.com/v1', apiModel: 'fast', hasKey: true, targetLang: 'zh-Hans', reasoning: 'auto', localCommand: '', localAutoStart: false,
     });
     assert.equal(saved.body.includes('sk-local'), false, 'the key never comes back');
+
+    // 保存 API 那一套不会动「指定模型」的模型名。
+    const pinned = await call(route, { method: 'POST', body: { modelProvider: 'opencode-go', modelName: 'claude-haiku-5-5' } });
+    assert.equal(pinned.status, 200);
+    assert.equal(pinned.json.translate.modelName, 'claude-haiku-5-5');
+    assert.equal(pinned.json.translate.apiModel, 'fast');
 
     // Switching the engine without a key keeps the saved one.
     const switched = await call(route, { method: 'POST', body: { engine: 'session' } });
@@ -113,6 +139,10 @@ test('the config route saves the engine, hides the key, and keeps it when omitte
     // An empty string is how the panel clears it.
     const cleared = await call(route, { method: 'POST', body: { apiKey: '' } });
     assert.equal(cleared.json.translate.hasKey, false);
+
+    // A malformed address is still refused at save time.
+    const wrongUrl = await call(route, { method: 'POST', body: { apiBaseURL: 'api.example.com' } });
+    assert.equal(wrongUrl.status, 400);
 
     // The store on disk still follows normalization.
     assert.equal(createModeStore(join(dir, 'state.json')).translate().apiKey, '');
