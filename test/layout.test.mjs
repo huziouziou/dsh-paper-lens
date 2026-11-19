@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { bodySizeOf, columnsFromLines, columnsFromSamples, furnitureBands, isFurniture, linesFromItems, orderLines, selectionText } from '../src/client/layout.js';
+import { bodyFlow, bodySizeOf, columnsFromLines, columnsFromSamples, furnitureBands, isFurniture, linesFromItems, orderLines, selectionText } from '../src/client/layout.js';
 
 const line = (text, { size = 10, x0 = 0.06, x1 = 0.47, top = 0.2, bottom = 0.212 } = {}) => ({ text, size, x0, x1, top, bottom });
 
@@ -147,7 +147,7 @@ test('orderLines keeps a full-width heading above both columns', () => {
 
 /* selectionText: the crossing-page case the reader complained about. */
 
-const piece = (text, { size = 10, top = 0.3, bottom = 0.312, left = 0.06, right = 0.47 } = {}) => ({ text, size, top, bottom, left, right });
+const piece = (text, { size = 10, top = 0.3, bottom = 0.312, left = 0.06, right = 0.47, rotated = false } = {}) => ({ text, size, top, bottom, left, right, rotated });
 
 const profile = (extra = {}) => ({
   body: 10,
@@ -215,3 +215,75 @@ test('selectionText falls back to the page body size when there is no profile', 
   ];
   assert.equal(selectionText(pages, null), 'body line here');
 });
+
+test('selectionText drops a sideways download stamp inside an upright passage', () => {
+  const pages = [
+    {
+      page: 1,
+      first: true,
+      pieces: [
+        piece('body line one'),
+        piece('Downloaded from academic.oup.com by guest on 18 November 2026', {
+          size: 5.8,
+          rotated: true,
+          top: 0.269,
+          bottom: 0.731,
+          left: 0.961,
+          right: 0.974,
+        }),
+      ],
+    },
+    { page: 2, last: true, pieces: [piece('body line two', { top: 0.15, bottom: 0.162 })] },
+  ];
+  assert.equal(selectionText(pages, profile()), 'body line one\nbody line two');
+});
+
+test('selectionText keeps a landscape page whose only text is rotated', () => {
+  const pages = [{ page: 1, first: true, last: true, pieces: [piece('landscape table note', { rotated: true })] }];
+  assert.equal(selectionText(pages, profile()), 'landscape table note');
+});
+
+test('isFurniture drops affiliations that sit just under the last body line', () => {
+  const ctx = { body: 8.7, first: false, last: false, flowTop: 0.06, flowBottom: 0.811, bands: [] };
+  assert.equal(isFurniture(line('Department of Chemistry, University of Cambridge', { size: 6.7, top: 0.831, bottom: 0.843 }), ctx), true);
+  // A caption is small too, but it belongs to the figure the reader selected.
+  assert.equal(isFurniture(line('Fig. 1 | Design of the protein library.', { size: 6.7, top: 0.831, bottom: 0.843 }), ctx), false);
+});
+
+test('isFurniture keeps body-size text below the flow on the page the selection ends on', () => {
+  const base = { body: 10, first: false, flowTop: 0.1, flowBottom: 0.8, bands: [] };
+  assert.equal(isFurniture(line('still body text', { size: 10, top: 0.85, bottom: 0.862 }), { ...base, last: true }), false);
+  // The page the selection merely passes through keeps nothing under its text block.
+  assert.equal(isFurniture(line('still body text', { size: 10, top: 0.85, bottom: 0.862 }), { ...base, last: false }), true);
+});
+
+test('linesFromItems ignores a sideways stamp', () => {
+  const stamp = { str: 'Downloaded from example.org', transform: [0, 5.8, -5.8, 0, 570, 400], width: 20, height: 5.8 };
+  const lines = linesFromItems([item('upright line'), stamp], viewportOf());
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].text, 'upright line');
+});
+
+test('isFurniture drops a small licence box in the middle of a figure page', () => {
+  const ctx = { body: 8.25, first: false, last: false, flowTop: 0.06, flowBottom: 0.9, bands: [] };
+  assert.equal(isFurniture(line('4.0 International License, which permits use and distribution', { size: 6, top: 0.487, bottom: 0.496 }), ctx), true);
+  assert.equal(isFurniture(line('© The Author(s) 2023', { size: 6, top: 0.588, bottom: 0.598 }), ctx), true);
+});
+
+test('isFurniture keeps a reference line that only carries a DOI', () => {
+  const ctx = { body: 8.25, first: false, last: false, flowTop: 0.06, flowBottom: 0.9, bands: [] };
+  assert.equal(isFurniture(line('1. Jumper, J. et al. Nature 596, 583 (2021). https://doi.org/10.1038/s41586', { size: 6, top: 0.5, bottom: 0.509 }), ctx), false);
+});
+
+test('bodyFlow ignores a footer set at almost body size', () => {
+  const lines = [
+    line('body first', { size: 8.25, top: 0.1, bottom: 0.112 }),
+    line('body last', { size: 8.25, top: 0.8, bottom: 0.812 }),
+    line('780 | Nature | Vol 614 | 23 February 2023', { size: 8, top: 0.964, bottom: 0.975 }),
+  ];
+  const bands = [{ y0: 0.968, y1: 0.972, share: 1 }];
+  const flow = bodyFlow(lines, 8.25, bands);
+  assert.ok(Math.abs(flow.flowBottom - 0.812) < 0.001);
+  assert.ok(Math.abs(flow.flowTop - 0.1) < 0.001);
+});
+

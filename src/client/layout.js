@@ -29,9 +29,18 @@ export const TOP_HARD = 0.05;
 /** At the very bottom of a page, even a last page's foot can go. */
 export const BOTTOM_HARD = 0.9;
 /** A line this much smaller than the body is secondary type (superscripts are exempt: they sit inside the body flow). */
-export const SMALL_RATIO = 0.92;
+export const SMALL_RATIO = 0.95;
 /** Words that mark a bottom block as a footer even when it sits above the page's last line. */
-export const FOOTER_MARKERS = /(?:©|\(c\)\s*\d{4}|copyright|downloaded from|to whom correspondence|correspondence should|corresponding author|all rights reserved|creative commons|open access|licen[cs]e|issn|https?:\/\/doi)/i;
+export const FOOTER_MARKERS = /(?:©|\(c\)\s*\d{4}|copyright|downloaded from|to whom correspondence|correspondence should|corresponding author|the author\(s\)|all rights reserved|terms of service|published by the american|creative commons|creativecommons\.org|open access|licen[cs]e|issn|https?:\/\/doi)/i;
+/** A caption is small type too, but it belongs to the figure or table above it. */
+export const CAPTION_MARKERS = /^\s*(?:fig(?:ure)?|table|scheme|extended\s+data|supplementary|box)\b/i;
+/**
+ * Licence boxes, copyright lines and correspondence notes are set small and are
+ * never the passage the reader wanted, wherever on the page they happen to sit.
+ * Kept apart from FOOTER_MARKERS because a reference may legitimately carry a DOI
+ * and an ISSN, but nobody translates a licence.
+ */
+export const LEGAL_MARKERS = /(?:©|\(c\)\s*\d{4}|copyright|creative commons|creativecommons\.org|all rights reserved|terms of service|open access|licen[cs]e|to whom correspondence|correspondence should|is published by|american association for the advancement)/i;
 
 /**
  * The document's body size: the font size that carries the most characters.
@@ -206,6 +215,23 @@ export function furnitureBands(samples) {
 }
 
 /**
+ * The vertical extent of a page's body type: from the first line of the top text
+ * block to the last line of the bottom one. Lines that sit in a furniture band are
+ * ignored, so a footer set at almost body size cannot drag the flow to the page
+ * edge. Returns null when the page has no body-size line at all.
+ */
+export function bodyFlow(lines, body, bands = []) {
+  const inBand = (line) => {
+    const centre = (Number(line.top) + Number(line.bottom)) / 2;
+    return (bands ?? []).some((band) => centre >= band.y0 - BAND_TOL && centre <= band.y1 + BAND_TOL);
+  };
+  const nearBody = (line) => body > 0 && Math.abs(Number(line.size) - body) <= Math.max(0.3, body * 0.05);
+  const rows = (lines ?? []).filter((line) => nearBody(line) && !inBand(line));
+  if (!rows.length) return null;
+  return { flowTop: Math.min(...rows.map((line) => line.top)), flowBottom: Math.max(...rows.map((line) => line.bottom)) };
+}
+
+/**
  * Is this line page furniture rather than part of the passage? `first`/`last`
  * say whether the line sits on the page the selection starts/ends on: only the
  * boundary pages can carry furniture the reader did not mean to include.
@@ -217,7 +243,6 @@ export function isFurniture(line, context) {
   const bottom = Number(line?.bottom) || top;
   const centre = (top + bottom) / 2;
   const small = body > 0 && size > 0 && size < body * SMALL_RATIO;
-
   const band = (bands ?? []).find((candidate) => centre >= candidate.y0 - BAND_TOL && centre <= candidate.y1 + BAND_TOL);
   if (band) {
     // A page the selection merely passes into keeps none of its furniture; the
@@ -229,13 +254,25 @@ export function isFurniture(line, context) {
     return centre < TOP_HARD || small;
   }
 
-  // Not a repeating band: fall back to position relative to the page's own body
-  // flow. Text above where the body starts is a running head; text below where it
-  // ends is a footer, a footnote block or a reference tail.
+  // Not a repeating band: a small licence/copyright block is furniture wherever it
+  // sits — publishers put it mid-column on figure pages and under the references.
+  const text = String(line?.text ?? '');
+  if (small && LEGAL_MARKERS.test(text) && !CAPTION_MARKERS.test(text)) return true;
+
+  // Fall back to position relative to the page's own body flow. Text above where
+  // the body starts is a running head; text below where it ends is a footer, a
+  // footnote block or a reference tail.
   if (small && centre < flowTop) return !first || top < TOP_HARD;
-  if (small && top > flowBottom) {
-    if (FOOTER_MARKERS.test(String(line?.text ?? ''))) return true;
-    return last ? top > BOTTOM_HARD : top > 0.85;
+  if (top > flowBottom) {
+    // A caption is small too, but it belongs to the figure above it.
+    if (CAPTION_MARKERS.test(text)) return false;
+    if (FOOTER_MARKERS.test(text)) return true;
+    // Below the last body line of a page the selection only passes through there
+    // is no prose left: affiliations, licence boxes and reference tails live
+    // there. The page the selection ends on keeps its ordinary type, so a drag
+    // that deliberately runs to the bottom of a page is not silently cut.
+    if (!last) return true;
+    return small;
   }
   return false;
 }
@@ -269,6 +306,7 @@ export function linesFromItems(items, viewport) {
   const width = Number(viewport?.width) || 1;
   const height = Number(viewport?.height) || 1;
   const boxes = [];
+  let rotated = 0;
   for (const item of items ?? []) {
     const text = String(item?.str ?? '');
     if (!text.trim() || !Array.isArray(item.transform)) continue;
@@ -291,13 +329,20 @@ export function linesFromItems(items, viewport) {
     // Rotated margin stamps ("Downloaded from …) extend past the page edge;
     // they are not text the reader can select, so they never join a line.
     if (box.x0 < -0.05 || box.x1 > 1.05 || box.top < -0.05 || box.bottom > 1.05) continue;
+    // A run set sideways is a margin stamp or a figure's axis label, never prose.
+    // The one case where rotated text is the page's only text is a landscape
+    // insert, and there it is kept (see the all-rotated check below).
+    box.rotated = Math.abs(transform[1]) > Math.abs(transform[0]) * 0.5;
+    if (box.rotated) rotated += 1;
     boxes.push(box);
   }
   if (!boxes.length) return [];
-  boxes.sort((a, b) => a.top - b.top || a.x0 - b.x0);
+  const usable = rotated > boxes.length * 0.7 ? boxes : boxes.filter((box) => !box.rotated);
+  if (!usable.length) return [];
+  usable.sort((a, b) => a.top - b.top || a.x0 - b.x0);
 
   const rows = [];
-  for (const box of boxes) {
+  for (const box of usable) {
     const tolerance = Math.max(0.0015, (0.35 * box.size) / height);
     let row = null;
     for (let i = rows.length - 1; i >= 0; i -= 1) {
@@ -373,7 +418,15 @@ export function selectionText(pages, profile) {
   (pages ?? []).forEach((page, order) => {
     const pageBody = body || Number(page.body) || bodySizeOf(page.pieces.map((piece) => ({ size: piece.size, text: piece.text }))) || 0;
     const flow = page.flowTop !== undefined && page.flowBottom !== undefined ? { flowTop: page.flowTop, flowBottom: page.flowBottom } : flowOfPieces(page.pieces, pageBody);
-    for (const piece of page.pieces ?? []) {
+    const pieces = page.pieces ?? [];
+    // A download stamp ("Downloaded from … by guest on …") is set sideways in the
+    // margin and is ordinary text to the browser's selection, so a range that runs
+    // past it swallows it. A page whose every run is rotated is a landscape insert,
+    // and there the rotated text is the only text there is.
+    const rotatedCount = pieces.filter((piece) => piece.rotated).length;
+    const keepRotated = pieces.length > 0 && rotatedCount === pieces.length;
+    for (const piece of pieces) {
+      if (piece.rotated && !keepRotated) continue;
       const top = Number(piece.top) || 0;
       const bottom = piece.bottom === undefined ? top : Number(piece.bottom) || top;
       if (isFurniture({ size: piece.size, top, bottom, text: piece.text }, { body: pageBody, first: Boolean(page.first), last: Boolean(page.last), flowTop: flow.flowTop, flowBottom: flow.flowBottom, bands })) continue;

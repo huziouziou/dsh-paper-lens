@@ -13,7 +13,7 @@
 import * as pdfjs from 'pdfjs-dist';
 import { attachSelectionFix } from './selection.js';
 import { findInItems, findAllInItems, boxesFor, searchOrder } from './textsearch.js';
-import { bodySizeOf, columnsFromSamples, furnitureBands, linesFromItems, selectionText } from './layout.js';
+import { bodyFlow, bodySizeOf, columnsFromSamples, furnitureBands, linesFromItems, selectionText } from './layout.js';
 import { anchorFrom, normalizeAnchor, topForAnchor } from './anchor.js';
 
 let sharedWorker; // undefined: not made yet; null: none (tests)
@@ -176,13 +176,9 @@ export class PdfView {
     const columns = body ? columnsFromSamples(samples, body) : [];
     const bands = furnitureBands(samples);
     const flows = new Map();
-    const bodyLines = (lines) => lines.filter((line) => body && Math.abs(line.size - body) <= Math.max(0.3, body * 0.05));
     for (const sample of samples) {
-      const source = bodyLines(sample.lines).length ? bodyLines(sample.lines) : sample.lines;
-      flows.set(sample.page, {
-        flowTop: Math.min(...source.map((line) => line.top)),
-        flowBottom: Math.max(...source.map((line) => line.bottom)),
-      });
+      const flow = bodyFlow(sample.lines, body, bands);
+      if (flow) flows.set(sample.page, flow);
     }
     profiles.set(this.container, {
       body,
@@ -787,11 +783,16 @@ function selectionPieces(range, root) {
       const rects = [...clipped.getClientRects()].filter((r) => r.width > 0.5 && r.height > 0.5);
       if (!rects.length) continue;
       const style = text.parentElement ? getComputedStyle(text.parentElement) : null;
+      const box = rects[0];
+      // pdf.js writes the run's angle into a `--rotate` custom property on the
+      // span; the rect is a second opinion for text that sits in a narrow column.
+      const angle = Math.abs(parseFloat(style?.getPropertyValue?.('--rotate') ?? '') || 0);
       pieces.push({
         pageEl,
         text: value,
         rects,
-        rect: rects[0],
+        rect: box,
+        rotated: angle > 20 || (box.height > box.width * 1.6 && value.trim().length > 2),
         fontSize: parseFloat(style?.fontSize ?? '') || 0,
       });
     }
@@ -880,6 +881,7 @@ function selectionPages(groups, profile) {
         bottom: (piece.rect.bottom - pageRect.top) / height,
         left: (piece.rect.left - pageRect.left) / width,
         right: (piece.rect.right - pageRect.left) / width,
+        rotated: Boolean(piece.rotated),
       })),
     };
     if (flow) {

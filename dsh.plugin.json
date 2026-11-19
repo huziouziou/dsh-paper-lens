@@ -1,6 +1,6 @@
 {
   "id": "dsh-paper-lens",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "main": "./src/index.js",
   "description": "Paper Lens：在项目里打开 PDF 就能用——右侧边栏阅读、划词翻译（流式，10 种语言）、划词引用到当前会话、四色批注。翻译可跟随会话模型、指定模型，或直连本机 llama.cpp 翻译服务（按需拉起、空闲自动关闭）。模型写的 [main.pdf p.7 \"exact words\"] 引用会变成可点链接，点开跳到该处并高亮。基于 dsh-cite-lens 0.3.1（MIT）改造。",
   "engines": {
