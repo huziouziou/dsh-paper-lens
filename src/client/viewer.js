@@ -13,7 +13,7 @@
 import * as pdfjs from 'pdfjs-dist';
 import { attachSelectionFix } from './selection.js';
 import { findInItems, findAllInItems, boxesFor, searchOrder } from './textsearch.js';
-import { isMarginFurniture } from './margins.js';
+import { bodySizeOf, columnsFromSamples, furnitureBands, linesFromItems, selectionText } from './layout.js';
 import { anchorFrom, normalizeAnchor, topForAnchor } from './anchor.js';
 
 let sharedWorker; // undefined: not made yet; null: none (tests)
@@ -57,6 +57,20 @@ const SETTLE_MS = 140; // scroll quiet this long before sharp re-renders
 const FAST_PX_PER_MS = 2.5; // above this the scroll is a fling: hold new renders
 
 const idle = (fn) => (typeof requestIdleCallback === 'function' ? requestIdleCallback(fn, { timeout: 250 }) : setTimeout(fn, 16));
+
+/**
+ * Layout profiles, one per view container: body size, column bands and the
+ * running-head/footer bands that repeat page after page. Kept off the instance
+ * so selectionInPdf — a plain function with only the container — can read it.
+ */
+const profiles = new WeakMap();
+
+/** Up to ten pages spread over the document: enough to see a repeating band. */
+function samplePages(total) {
+  if (total <= 10) return Array.from({ length: total }, (_, index) => index + 1);
+  const wanted = [1, 2, 3, 4, Math.round(total * 0.35), Math.round(total * 0.55), Math.round(total * 0.75), total - 2, total - 1, total];
+  return [...new Set(wanted.filter((n) => n >= 1 && n <= total))];
+}
 
 export class PdfView {
   /**
@@ -131,8 +145,56 @@ export class PdfView {
     this.baseSize = first.getViewport({ scale: 1 });
     this.build();
     // Real page sizes arrive in the background, so mixed portrait/landscape
-    // papers settle without blocking the first paint.
+    // papers settle without blocking the first paint. The layout profile is read
+    // the same way: nothing waits for it, and a selection made before it lands
+    // falls back to the per-page heuristics.
     this.loadSizes();
+    this.buildProfile().catch(() => {});
+  }
+
+  /**
+   * Read a handful of pages and work out what this document looks like: the body
+   * size, the column bands, and the y bands where a running head or footer
+   * repeats. Journals disagree about all three (NAR prints its header at body
+   * size, Nature prints the footer at 0.97x), so guessing from one page or from
+   * font size alone does not hold up across a real library.
+   */
+  async buildProfile() {
+    const doc = this.doc;
+    if (!doc) return;
+    const samples = [];
+    for (const pageNo of samplePages(doc.numPages)) {
+      if (this.disposed) return;
+      const page = await doc.getPage(pageNo);
+      const viewport = page.getViewport({ scale: 1 });
+      const content = await page.getTextContent();
+      const lines = linesFromItems(content.items, viewport);
+      if (lines.length) samples.push({ page: pageNo, lines, width: viewport.width, height: viewport.height });
+    }
+    if (this.disposed || !samples.length) return;
+    const body = bodySizeOf(samples.flatMap((sample) => sample.lines));
+    const columns = body ? columnsFromSamples(samples, body) : [];
+    const bands = furnitureBands(samples);
+    const flows = new Map();
+    const bodyLines = (lines) => lines.filter((line) => body && Math.abs(line.size - body) <= Math.max(0.3, body * 0.05));
+    for (const sample of samples) {
+      const source = bodyLines(sample.lines).length ? bodyLines(sample.lines) : sample.lines;
+      flows.set(sample.page, {
+        flowTop: Math.min(...source.map((line) => line.top)),
+        flowBottom: Math.max(...source.map((line) => line.bottom)),
+      });
+    }
+    profiles.set(this.container, {
+      body,
+      columns,
+      bands,
+      flows,
+      pages: doc.numPages,
+      // PDF points: the text layer reports font sizes in rendered pixels, and
+      // these turn them back into points so they compare with `body`.
+      baseWidth: this.baseSize?.width ?? 0,
+      widths: new Map(samples.map((sample) => [sample.page, sample.width])),
+    });
   }
 
   get numPages() {
@@ -672,7 +734,7 @@ export function selectionInPdf(selection, root) {
   if (!pageEl || !root.contains(pageEl)) return null;
   const pieces = selectionPieces(range, root);
   if (!pieces.length) return null;
-  const text = selectionText(groupPieces(pieces));
+  const text = selectionText(selectionPages(groupPieces(pieces), profileFor(root)), profileFor(root));
   if (text.trim() === '') return null;
   const pageRect = pageEl.getBoundingClientRect();
   const boxes = [...range.getClientRects()]
@@ -783,29 +845,50 @@ function pageBodySize(pageEl) {
   return body;
 }
 
-function selectionText(groups) {
-  const lines = [];
-  groups.forEach((group, index) => {
-    const firstPage = index === 0;
-    const lastPage = index === groups.length - 1;
+/** The profile of the view that owns this DOM subtree, if it has one yet. */
+function profileFor(root) {
+  if (!root) return null;
+  return profiles.get(root) ?? profiles.get(root.querySelector?.('.dpa-pages')) ?? null;
+}
+
+/**
+ * Turn the DOM selection into the plain page/piece shape layout.js reads.
+ *
+ * The text layer's font sizes are in rendered pixels, so they are converted
+ * back to the PDF's points before they are compared with the profile's body
+ * size. Pages the profile never sampled keep the document's base width, which
+ * is what the zoom scale is applied to.
+ */
+function selectionPages(groups, profile) {
+  const baseWidth = profile?.baseWidth ?? 0;
+  return groups.map((group, index) => {
     const pageRect = group.pageEl.getBoundingClientRect();
-    const body = pageBodySize(group.pageEl) || medianFontSize(group.pieces);
-    for (const piece of group.pieces) {
-      const small = body > 0 && piece.fontSize > 0 && piece.fontSize < body * 0.95;
-      const fromTop = piece.rect.top - pageRect.top;
-      const fromBottom = pageRect.bottom - piece.rect.bottom;
-      // Running heads and license banners at the page edge are furniture, not the
-      // passage (see margins.js for why a hard band is needed).
-      if (isMarginFurniture({ first: firstPage, last: lastPage, small, top: fromTop, bottom: fromBottom, height: pageRect.height })) continue;
-      const line = lines[lines.length - 1];
-      if (line && line.pageEl === group.pageEl && Math.abs(piece.rect.top - line.top) < Math.max(2, line.height * 0.6)) {
-        line.text += piece.text;
-        line.top = Math.min(line.top, piece.rect.top);
-        line.height = Math.max(line.height, piece.rect.height);
-      } else {
-        lines.push({ pageEl: group.pageEl, top: piece.rect.top, height: piece.rect.height, text: piece.text });
-      }
+    const pageNo = Number(group.pageEl.dataset.page);
+    const height = pageRect.height || 1;
+    const width = pageRect.width || 1;
+    const widthPt = profile?.widths?.get(pageNo) ?? baseWidth;
+    const ptPerPx = widthPt > 0 ? widthPt / width : 1;
+    const flow = profile?.flows?.get(pageNo);
+    const page = {
+      page: pageNo,
+      first: index === 0,
+      last: index === groups.length - 1,
+      pieces: group.pieces.map((piece) => ({
+        text: piece.text,
+        size: piece.fontSize * ptPerPx,
+        top: (piece.rect.top - pageRect.top) / height,
+        bottom: (piece.rect.bottom - pageRect.top) / height,
+        left: (piece.rect.left - pageRect.left) / width,
+        right: (piece.rect.right - pageRect.left) / width,
+      })),
+    };
+    if (flow) {
+      page.flowTop = flow.flowTop;
+      page.flowBottom = flow.flowBottom;
+    } else if (!profile?.body) {
+      // No profile at all: fall back to the body size of this page's own text.
+      page.body = pageBodySize(group.pageEl) || medianFontSize(group.pieces);
     }
+    return page;
   });
-  return lines.map((line) => line.text.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
 }
