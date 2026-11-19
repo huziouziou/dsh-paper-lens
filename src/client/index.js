@@ -218,6 +218,8 @@ const CSS = [
   '.dpa-tr-warn{margin-top:8px;padding-top:6px;border-top:1px dashed var(--dsw-alias-border-l2,rgba(0,0,0,.2));font-size:11px;line-height:1.5;color:var(--dsw-alias-state-warning-primary,#b45309)}',
   '.dpa-tr-partial{margin-bottom:6px;opacity:.75}',
   '.dpa-tr-elapsed{font-variant-numeric:tabular-nums;opacity:.75}',
+  '.dpa-tr-source{margin-top:8px;padding-top:6px;border-top:1px dashed var(--dsw-alias-border-l2,rgba(0,0,0,.2));font-size:11px;line-height:1.55;white-space:pre-wrap;word-break:break-word;max-height:26vh;overflow:auto;opacity:.9}',
+  '.dpa-tr-source-label{margin-bottom:2px;font-size:10px;letter-spacing:.03em;text-transform:uppercase;opacity:.6}',
   '@keyframes dpa-blink{0%,50%{opacity:1}50.01%,100%{opacity:0}}',
   '.dpa-center{padding:40px;text-align:center;color:var(--dsw-alias-label-secondary,#aaa)}',
   `::highlight(${HIGHLIGHT}){color:#60a5fa;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:2px}`,
@@ -364,6 +366,8 @@ function PdfAskBody(props) {
   const [tr, setTr] = useState(null);
   /** 气泡被拖动后的位移（相对选区位置），null = 还没动过。 */
   const [trDrag, setTrDrag] = useState(null);
+  /** 气泡里的「原文」是否展开：启发式取词偶尔会多带或少带，留一条能核对的路。 */
+  const [trSourceOpen, setTrSourceOpen] = useState(false);
   const trBodyRef = useRef(null);
   /** 正在跑的翻译请求；再点「译」或点「取消」时用它停掉上一个流。 */
   const abortRef = useRef(null);
@@ -722,12 +726,13 @@ function PdfAskBody(props) {
     abortRef.current = controller;
     const startedAt = Date.now();
     let acc = '';
-    setTr({ phase: 'streaming', rect, text: '', startedAt, tables });
+    setTrSourceOpen(false);
+    setTr({ phase: 'streaming', rect, text: '', startedAt, tables, source: text });
     // 原文已经拿到，清掉 PDF 上的选区：气泡压在选区上会看花，也让人以为气泡里的字被选住了。
     document.getSelection()?.removeAllRanges();
 
     // 失败时保留已经流出来的半截：至少能看到译到哪儿，而不是一句空白的「失败」。
-    const fail = (error) => setTr({ phase: 'error', rect, error, text: acc, startedAt, tables });
+    const fail = (error) => setTr({ phase: 'error', rect, error, text: acc, startedAt, tables, source: text });
     /** 服务端在结束时可能带一行 warning（截断但有半截译文），留给 done 一起收口。 */
     let warning = null;
     try {
@@ -755,7 +760,7 @@ function PdfAskBody(props) {
         const now = Date.now();
         if (!force && now - painted < 60) return;
         painted = now;
-        setTr({ phase: 'streaming', rect, text: acc, startedAt });
+        setTr({ phase: 'streaming', rect, text: acc, startedAt, source: text });
       };
 
       for (;;) {
@@ -787,7 +792,7 @@ function PdfAskBody(props) {
 
       const final = acc.trim();
       if (!final) { fail('模型没有返回译文'); return; }
-      setTr({ phase: 'done', rect, text: final, warning, startedAt, tables });
+      setTr({ phase: 'done', rect, text: final, warning, startedAt, tables, source: text });
     } catch (error) {
       if (error?.name === 'AbortError') return;
       fail(`翻译失败：${error?.message ?? error}`);
@@ -1576,6 +1581,13 @@ function PdfAskBody(props) {
               : null,
             h('button', {
               type: 'button',
+              title: trSourceOpen ? '收起取到的原文' : '看看这次到底取了哪些原文',
+              'aria-pressed': trSourceOpen ? 'true' : 'false',
+              onPointerDown: (event) => event.stopPropagation(), // 别让点按钮变成拖动
+              onClick: () => setTrSourceOpen((open) => !open),
+            }, '原文'),
+            h('button', {
+              type: 'button',
               className: 'dpa-tr-copy',
               title: '复制译文',
               disabled: tr.phase !== 'done' || !String(tr.text ?? '').trim(),
@@ -1610,6 +1622,14 @@ function PdfAskBody(props) {
                   tr.tables > 0 ? h('div', { className: 'dpa-tr-warn' }, `选区里有 ${tr.tables} 处表格，已保留原样，没有送翻译`) : null,
                   tr.phase === 'streaming' ? h('span', { className: 'dpa-tr-caret', 'aria-hidden': 'true' }) : null,
                 ),
+            trSourceOpen && tr.source
+              ? h(
+                  'div',
+                  { className: 'dpa-tr-source' },
+                  h('div', { className: 'dpa-tr-source-label' }, '取到的原文'),
+                  tr.source,
+                )
+              : null,
           ),
         )
       : null,
