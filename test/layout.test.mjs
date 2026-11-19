@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { bodyFlow, bodySizeOf, columnsFromLines, columnsFromSamples, furnitureBands, isFurniture, linesFromItems, orderLines, selectionText } from '../src/client/layout.js';
+import { bodyFlow, bodySizeOf, columnsFromLines, columnsFromSamples, furnitureBands, isFurniture, linesFromItems, orderLines, selectionParts, selectionText } from '../src/client/layout.js';
 
 const line = (text, { size = 10, x0 = 0.06, x1 = 0.47, top = 0.2, bottom = 0.212 } = {}) => ({ text, size, x0, x1, top, bottom });
 
@@ -285,5 +285,82 @@ test('bodyFlow ignores a footer set at almost body size', () => {
   const flow = bodyFlow(lines, 8.25, bands);
   assert.ok(Math.abs(flow.flowBottom - 0.812) < 0.001);
   assert.ok(Math.abs(flow.flowTop - 0.1) < 0.001);
+});
+
+/** Rows of a table, as the text layer delivers them: one run per cell. */
+const tableRow = (cells, i, size = 8) => cells.map((text, k) => piece(text, {
+  size,
+  top: 0.4 + i * 0.014,
+  bottom: 0.412 + i * 0.014,
+  left: 0.08 + k * 0.12,
+  right: 0.08 + k * 0.12 + 0.1,
+}));
+
+test('selectionParts keeps table rows out of the text and reports them', () => {
+  const pages = [
+    {
+      page: 1,
+      first: true,
+      last: true,
+      pieces: [
+        piece('Table 1 | Kinetics of the designed variants', { top: 0.38, bottom: 0.392, left: 0.08, right: 0.9 }),
+        ...tableRow(['Variant', 'kcat', 'KM'], 1),
+        ...tableRow(['6258_47', '2.6', '0.11'], 2),
+        ...tableRow(['6259_16', '3.1', '0.09'], 3),
+        ...tableRow(['EGFP', '0.0', '0.0'], 4),
+        piece('The variants were expressed in HEK293 cells and purified.', { top: 0.5, bottom: 0.512 }),
+      ],
+    },
+  ];
+  const parts = selectionParts(pages, profile());
+  assert.equal(parts.tables.length, 1);
+  assert.match(parts.tables[0], /6258_47/);
+  assert.match(parts.tables[0], / \| /);
+  assert.doesNotMatch(parts.text, /6258_47/);
+  assert.match(parts.text, /Table 1 \| Kinetics/);
+  assert.match(parts.text, /HEK293/);
+});
+
+test('selectionParts leaves prose with numbers alone', () => {
+  const pages = [
+    {
+      page: 1,
+      first: true,
+      last: true,
+      pieces: [
+        piece('The model improves affinity 2.6-fold in 2020 and 4.1-fold in 2021.', { top: 0.2, bottom: 0.212 }),
+        piece('Each of the 48 designs was tested against 3 HLA alleles.', { top: 0.216, bottom: 0.228 }),
+      ],
+    },
+  ];
+  const parts = selectionParts(pages, profile());
+  assert.equal(parts.tables.length, 0);
+  assert.match(parts.text, /2\.6-fold/);
+});
+
+test('selectionParts reports a table-only selection with no prose', () => {
+  const pages = [
+    {
+      page: 1,
+      first: true,
+      last: true,
+      pieces: [...tableRow(['6258_47', '2.6', '0.11'], 1), ...tableRow(['6259_16', '3.1', '0.09'], 2), ...tableRow(['EGFP', '0.0', '0.0'], 3)],
+    },
+  ];
+  const parts = selectionParts(pages, profile());
+  assert.equal(parts.text, '');
+  assert.equal(parts.tables.length, 1);
+});
+
+test('selectionText still returns only the prose', () => {
+  const pages = [
+    {
+      page: 1,
+      first: true,
+      last: true,
+      pieces: [piece('Body line before the table.', { top: 0.3, bottom: 0.312 }), ...tableRow(['6258_47', '2.6', '0.11'], 1), ...tableRow(['6259_16', '3.1', '0.09'], 2), ...tableRow(['EGFP', '0.0', '0.0'], 3)],
+    },
+  ];
+  assert.equal(selectionText(pages, profile()), 'Body line before the table.');
 });
 

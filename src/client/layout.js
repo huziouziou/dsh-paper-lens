@@ -411,6 +411,56 @@ export function linesFromItems(items, viewport) {
  * line across the whole page.
  */
 export function selectionText(pages, profile) {
+  return selectionParts(pages, profile).text;
+}
+
+/**
+ * The selection split into prose and tables. A table's cells come through the
+ * text layer as one run per row ("6258 47 2.6 0.1"), so translating a range that
+ * covers a table produces numbers with the words — useless and slow. The rows
+ * are pulled out here and the caller decides what to do with them; the prose is
+ * what actually gets translated.
+ */
+export function selectionParts(pages, profile) {
+  const lines = selectionLines(pages, profile);
+  const columns = new Map();
+  for (const line of lines) {
+    const key = `${line.order}:${line.column}`;
+    if (!columns.has(key)) columns.set(key, []);
+    columns.get(key).push(line);
+  }
+  // A table is read as one run per row, and its rows share a column band. A run
+  // of three or more numeric rows that also start at the same place (the first
+  // cell) and have the same number of cells is a table; chart tick labels and
+  // figure legends do not repeat that shape.
+  const tableRows = new Set();
+  const tables = [];
+  for (const group of columns.values()) {
+    const rows = group.filter((line) => isTableLine(line));
+    const buckets = new Map();
+    for (const row of rows) {
+      const key = `${row.runs}@${Math.round((row.x0 ?? 0) * 50)}`;
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(row);
+    }
+    for (const bucket of buckets.values()) {
+      if (bucket.length < 3) continue;
+      bucket.forEach((row) => tableRows.add(row));
+      tables.push(bucket.map((row) => row.text.replace(/\s+/g, ' ').trim()).join(' | '));
+    }
+  }
+  const text = [];
+  for (const line of lines) {
+    if (tableRows.has(line)) continue;
+    const value = line.text.replace(/\s+/g, ' ').trim();
+    // A rule of dots or dashes between table rows carries no words.
+    if (!value || /^[\s.·…_–—-]+$/.test(value)) continue;
+    text.push(value);
+  }
+  return { text: text.join('\n'), tables };
+}
+
+function selectionLines(pages, profile) {
   const body = profile?.body ?? 0;
   const bands = profile?.bands ?? [];
   const columns = profile?.columns ?? [];
@@ -437,16 +487,37 @@ export function selectionText(pages, profile) {
       const lineHeight = Math.max(0.0015, (top - bottom) || 0.012);
       const sameLine = line && line.order === order && line.column === column && Math.abs(top - line.top) < Math.max(0.0025 * 0.5, lineHeight * 0.6);
       if (sameLine) {
-        line.text += piece.text;
+        // Cells come as separate runs with no space between them, so keep the
+        // words apart or the row reads as one long token.
+        const pieceText = String(piece.text ?? '');
+        if (line.text && !/\s$/.test(line.text) && !/^\s/.test(pieceText)) line.text += ' ';
+        line.text += pieceText;
         line.top = Math.min(line.top, top);
         line.x1 = Math.max(line.x1, x1);
+        line.runs += Number(piece.runs) || 1;
       } else {
-        lines.push({ order, column, top, x0, x1, text: String(piece.text ?? '') });
+        lines.push({ order, column, top, x0, x1, size: Number(piece.size) || 0, runs: Number(piece.runs) || 1, text: String(piece.text ?? '') });
       }
     }
   });
   lines.sort((a, b) => a.order - b.order || a.column - b.column || a.top - b.top || a.x0 - b.x0);
-  return lines.map((line) => line.text.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
+  return lines;
+}
+
+/**
+ * A table row is built from several separate runs (one per cell) and at least
+ * two of its cells are plain numbers. Requiring the separate runs is what keeps
+ * a reference entry — one run of prose that happens to contain page numbers —
+ * out of the table bucket.
+ */
+function isTableLine(line) {
+  if ((line.runs ?? 1) < 3) return false;
+  const width = Math.max(0, (line.x1 ?? 0) - (line.x0 ?? 0));
+  if (width > 0.72) return false;
+  const tokens = String(line.text ?? '').split(/\s+/).filter(Boolean);
+  if (tokens.length < 3) return false;
+  const numeric = tokens.filter((token) => /^[±<>=]?\d[\d.,/–-]*$/.test(token) || /^\d+\.$/.test(token)).length;
+  return numeric >= 2 && numeric / tokens.length >= 0.3;
 }
 
 /** Which column band a horizontal position falls in. */

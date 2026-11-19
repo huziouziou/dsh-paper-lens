@@ -707,12 +707,13 @@ function PdfAskBody(props) {
   const translateSelection = async () => {
     if (!pop) return;
     const text = cleanSelection(pop.text);
+    const tables = Number(pop.tables) || 0;
     const rect = pop.anchor ?? pop.rect;
     setPop(null);
     setEnds(null);
     setTrDrag(null);
     if (!text) {
-      say('没有选中可翻译的文字', true);
+      say(tables > 0 ? '选区里只有表格，已保留原样，没有送翻译' : '没有选中可翻译的文字', true);
       return;
     }
     // 上一段还没结束就又点了「译」：先停掉旧流，免两段译文混进同一个气泡。
@@ -721,12 +722,12 @@ function PdfAskBody(props) {
     abortRef.current = controller;
     const startedAt = Date.now();
     let acc = '';
-    setTr({ phase: 'streaming', rect, text: '', startedAt });
+    setTr({ phase: 'streaming', rect, text: '', startedAt, tables });
     // 原文已经拿到，清掉 PDF 上的选区：气泡压在选区上会看花，也让人以为气泡里的字被选住了。
     document.getSelection()?.removeAllRanges();
 
     // 失败时保留已经流出来的半截：至少能看到译到哪儿，而不是一句空白的「失败」。
-    const fail = (error) => setTr({ phase: 'error', rect, error, text: acc, startedAt });
+    const fail = (error) => setTr({ phase: 'error', rect, error, text: acc, startedAt, tables });
     /** 服务端在结束时可能带一行 warning（截断但有半截译文），留给 done 一起收口。 */
     let warning = null;
     try {
@@ -786,7 +787,7 @@ function PdfAskBody(props) {
 
       const final = acc.trim();
       if (!final) { fail('模型没有返回译文'); return; }
-      setTr({ phase: 'done', rect, text: final, warning, startedAt });
+      setTr({ phase: 'done', rect, text: final, warning, startedAt, tables });
     } catch (error) {
       if (error?.name === 'AbortError') return;
       fail(`翻译失败：${error?.message ?? error}`);
@@ -1606,6 +1607,7 @@ function PdfAskBody(props) {
                   null,
                   tr.text,
                   tr.warning ? h('div', { className: 'dpa-tr-warn' }, tr.warning) : null,
+                  tr.tables > 0 ? h('div', { className: 'dpa-tr-warn' }, `选区里有 ${tr.tables} 处表格，已保留原样，没有送翻译`) : null,
                   tr.phase === 'streaming' ? h('span', { className: 'dpa-tr-caret', 'aria-hidden': 'true' }) : null,
                 ),
           ),

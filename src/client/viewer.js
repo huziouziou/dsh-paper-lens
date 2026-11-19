@@ -13,7 +13,7 @@
 import * as pdfjs from 'pdfjs-dist';
 import { attachSelectionFix } from './selection.js';
 import { findInItems, findAllInItems, boxesFor, searchOrder } from './textsearch.js';
-import { bodyFlow, bodySizeOf, columnsFromSamples, furnitureBands, linesFromItems, selectionText } from './layout.js';
+import { bodyFlow, bodySizeOf, columnsFromSamples, furnitureBands, linesFromItems, selectionParts } from './layout.js';
 import { anchorFrom, normalizeAnchor, topForAnchor } from './anchor.js';
 
 let sharedWorker; // undefined: not made yet; null: none (tests)
@@ -730,8 +730,10 @@ export function selectionInPdf(selection, root) {
   if (!pageEl || !root.contains(pageEl)) return null;
   const pieces = selectionPieces(range, root);
   if (!pieces.length) return null;
-  const text = selectionText(selectionPages(groupPieces(pieces), profileFor(root)), profileFor(root));
-  if (text.trim() === '') return null;
+  const parts = selectionParts(selectionPages(groupPieces(pieces), profileFor(root)), profileFor(root));
+  const text = parts.text;
+  const tables = parts.tables.length;
+  if (text.trim() === '' && tables === 0) return null;
   const pageRect = pageEl.getBoundingClientRect();
   const boxes = [...range.getClientRects()]
     .filter((r) => r.width > 1 && r.height > 1)
@@ -752,7 +754,7 @@ export function selectionInPdf(selection, root) {
   const visible = rects.filter((r) => r.bottom > 4 && r.top < height - 4 && r.right > 0 && r.left < window.innerWidth);
   const anchor = visible.length ? visible[visible.length - 1] : null;
   const pages = [...new Set(pieces.map((piece) => Number(piece.pageEl.dataset.page)))];
-  return { page: Number(pageEl.dataset.page), pages, text, boxes, rect, anchor };
+  return { page: Number(pageEl.dataset.page), pages, text, tables, boxes, rect, anchor };
 }
 
 /**
